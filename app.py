@@ -1,15 +1,13 @@
 """
 Digital Zoo Linkbuild Generator — Web UI
 =========================================
-生成 .docx 檔案，下載後拖入 Google Drive 即自動轉為 Google Doc。
-不需要任何 Google API 認證。
-
 streamlit run app.py
 """
 
 import os
 import time
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 
@@ -27,7 +25,7 @@ from generate import (
 )
 
 # ================================================================
-# Read secrets
+# Secrets
 # ================================================================
 try:
     API_KEY = st.secrets["OPENROUTER_API_KEY"]
@@ -38,12 +36,10 @@ if not API_KEY:
     st.error("⚠️ 請設定 OPENROUTER_API_KEY（Streamlit Secrets 或環境變數）")
     st.stop()
 
-MODEL = os.environ.get("LB_MODEL", "")
-if not MODEL:
-    try:
-        MODEL = st.secrets.get("LB_MODEL", "deepseek/deepseek-chat-v3-0324")
-    except Exception:
-        MODEL = "deepseek/deepseek-chat-v3-0324"
+try:
+    MODEL = st.secrets.get("LB_MODEL", "deepseek/deepseek-chat-v3-0324")
+except Exception:
+    MODEL = os.environ.get("LB_MODEL", "deepseek/deepseek-chat-v3-0324")
 
 # ================================================================
 # UI
@@ -51,11 +47,8 @@ if not MODEL:
 st.title("🔗 DZ Linkbuild Generator")
 st.caption("上傳 Excel → 選擇 Batch → 生成 .docx → 下載後拖入 Google Drive")
 
-# ── Step 1: Upload ──
-excel_file = st.file_uploader(
-    "📊 上傳 Linkbuilding Excel",
-    type=["xlsx"],
-)
+# ── Upload ──
+excel_file = st.file_uploader("📊 上傳 Linkbuilding Excel", type=["xlsx"])
 
 if not excel_file:
     st.info("👆 請先上傳 Excel 檔案")
@@ -80,10 +73,10 @@ except Exception as e:
     st.stop()
 
 if not batch_counts:
-    st.error("在 Excel 中找不到任何 Batch 資料")
+    st.error("找不到任何 Batch 資料")
     st.stop()
 
-# ── Step 2: Select ──
+# ── Select ──
 st.divider()
 col1, col2, col3 = st.columns([2, 1, 1])
 
@@ -115,6 +108,7 @@ with col3:
 
 filtered = [a for a in articles if start_num <= a["number"] <= end_num]
 
+# ── Preview table ──
 with st.expander(f"📋 預覽（{len(filtered)} 篇）", expanded=False):
     preview_data = []
     for a in filtered:
@@ -128,48 +122,106 @@ with st.expander(f"📋 預覽（{len(filtered)} 篇）", expanded=False):
         })
     st.dataframe(preview_data, use_container_width=True, hide_index=True)
 
-# ── Step 3: Generate ──
+# ── Settings ──
+with st.expander("⚙️ 進階設定", expanded=False):
+    parallel = st.slider(
+        "同時生成篇數", 1, 5, 3,
+        help="同時呼叫 API 的數量。數字越大越快，但太高可能觸發 rate limit。",
+    )
+
+# ── Buttons ──
 st.divider()
+col_a, col_b, col_spacer = st.columns([1, 1, 2])
+with col_a:
+    btn_generate = st.button("🚀 生成文章", type="primary", use_container_width=True)
+with col_b:
+    btn_dry = st.button("📝 Dry Run（預覽文字）", use_container_width=True)
 
-if st.button("🚀 生成文章", type="primary", use_container_width=False):
 
+# ================================================================
+# Generation
+# ================================================================
+def _generate_one(article):
+    """Worker function for parallel generation."""
+    content = generate_article_content(article, API_KEY, MODEL)
+    return article, content
+
+
+if btn_generate or btn_dry:
+    is_dry_run = btn_dry
     articles_with_content = []
     failed = []
+    total = len(filtered)
 
     progress_bar = st.progress(0, text="準備中...")
     status_area = st.container()
-    total = len(filtered)
 
-    for i, article in enumerate(filtered):
-        num = article["number"]
-        kw1 = article["keyword1"]
-        kw2 = article["keyword2"]
-        label = f"#{num}: {kw1}" + (f" + {kw2}" if kw2 else "")
+    if parallel <= 1:
+        # Sequential
+        for i, article in enumerate(filtered):
+            num = article["number"]
+            label = f"#{num}: {article['keyword1']}"
+            progress_bar.progress(i / total, text=f"⏳（{i+1}/{total}）{label}")
 
-        progress_bar.progress(i / total, text=f"⏳ 生成中（{i+1}/{total}）：{label}")
+            content = generate_article_content(article, API_KEY, MODEL)
+            if content:
+                articles_with_content.append((article, content))
+                with status_area:
+                    st.success(f"✅ #{num} — {content['h1']}")
+            else:
+                failed.append(num)
+                with status_area:
+                    st.error(f"❌ #{num} — 生成失敗")
+    else:
+        # Parallel
+        done_count = 0
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = {
+                executor.submit(_generate_one, art): art
+                for art in filtered
+            }
+            for future in as_completed(futures):
+                article, content = future.result()
+                done_count += 1
+                num = article["number"]
+                progress_bar.progress(
+                    done_count / total,
+                    text=f"⏳（{done_count}/{total}）已完成 #{num}",
+                )
+                if content:
+                    articles_with_content.append((article, content))
+                    with status_area:
+                        st.success(f"✅ #{num} — {content['h1']}")
+                else:
+                    failed.append(num)
+                    with status_area:
+                        st.error(f"❌ #{num} — 生成失敗")
 
-        content = generate_article_content(article, API_KEY, MODEL)
-
-        if content:
-            articles_with_content.append((article, content))
-            with status_area:
-                st.success(f"✅ #{num} — {content['h1']}")
-        else:
-            failed.append(num)
-            with status_area:
-                st.error(f"❌ #{num} — 生成失敗")
-
-        if i < total - 1:
-            time.sleep(3)
+        # Sort by article number (parallel results come in random order)
+        articles_with_content.sort(key=lambda x: x[0]["number"])
 
     progress_bar.progress(1.0, text=f"✅ 完成 {len(articles_with_content)}/{total} 篇")
 
-    # ── Build .docx ──
-    if articles_with_content:
-        st.divider()
+    # ── Output ──
+    st.divider()
 
+    if not articles_with_content:
+        st.error("所有文章都生成失敗")
+    elif is_dry_run:
+        # Text preview
+        st.subheader("📝 文字預覽")
+        for article, content in articles_with_content:
+            with st.expander(f"#{article['number']} — {content['h1']}", expanded=False):
+                text = f"H1：{content['h1']}\n\n"
+                for sec in content["sections"]:
+                    if sec.get("h2"):
+                        text += f"H2：{sec['h2']}\n\n"
+                    text += sec.get("body", "") + "\n\n"
+                st.text(text)
+    else:
+        # Build .docx
         with st.spinner("📄 建立 Word 文件中..."):
-            filename = f"Combined_2026_May_Internal_Batch_{selected_batch}"
+            filename = f"Combined_Batch_{selected_batch}"
             if start_num != first_num or end_num != last_num:
                 filename += f"_#{start_num}-{end_num}"
             filename += ".docx"
@@ -180,12 +232,10 @@ if st.button("🚀 生成文章", type="primary", use_container_width=False):
 
             with open(tmp_docx_path, "rb") as f:
                 docx_bytes = f.read()
-
             os.unlink(tmp_docx_path)
 
         st.balloons()
-        st.success(f"🎉 完成！已生成 {len(articles_with_content)} 篇文章。")
-
+        st.success(f"🎉 已生成 {len(articles_with_content)} 篇文章")
         st.download_button(
             label=f"⬇️ 下載 {filename}",
             data=docx_bytes,
@@ -193,13 +243,11 @@ if st.button("🚀 生成文章", type="primary", use_container_width=False):
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             type="primary",
         )
-
-        st.caption("💡 下載後將 .docx 拖入 Google Drive，會自動轉為 Google Doc 格式。")
+        st.caption("💡 下載後拖入 Google Drive → 自動轉為 Google Doc")
 
     if failed:
-        st.warning(f"⚠️ 失敗文章：{failed}。可調整範圍重新跑。")
+        st.warning(f"⚠️ 失敗文章：{failed}")
 
-# Cleanup
 try:
     os.unlink(tmp_excel_path)
 except Exception:

@@ -154,9 +154,16 @@ def build_prompt(article):
     lang = detect_language(kw1 + kw2)
 
     if lang == "zh-HK":
-        lang_instruction = "用繁體中文（香港用語）撰寫。"
+        lang_instruction = """語言要求：
+- 使用繁體中文書面語撰寫，語體風格對標香港主流網絡媒體（如《香港01》、《經濟日報》副刊）
+- 嚴禁使用廣東話口語、粵語語助詞或任何口語化表達（例如「嘅」「咗」「啲」「點解」「攞」「揀」「搞掂」「嚟」等）
+- 用詞正式但自然，語氣平實而有深度，行文要流暢，段落之間要有邏輯銜接
+- 用「的」不用「嘅」，用「了」不用「咗」，用「一些」不用「啲」，用「為什麼」不用「點解」"""
     else:
-        lang_instruction = "Write in fluent English."
+        lang_instruction = """Language requirements:
+- Write in fluent, professional English suitable for online media
+- Maintain a formal but accessible tone, similar to quality editorial content
+- Ensure logical flow between paragraphs with smooth transitions"""
 
     # Build keyword section
     if kw2:
@@ -492,21 +499,24 @@ def build_docx_file(articles_with_content, output_path):
         output_path: path to save the .docx file
     """
     from docx import Document as DocxDocument
-    from docx.shared import Pt
+    from docx.shared import Pt, Twips
+    from docx.enum.text import WD_LINE_SPACING
 
     doc = DocxDocument()
 
-    # Set default font
+    # Set Normal style: Arial 12pt, single spacing, no paragraph spacing
     style = doc.styles["Normal"]
-    style.font.size = Pt(11)
+    style.font.size = Pt(12)
     style.font.name = "Arial"
+    style.paragraph_format.space_before = Pt(0)
+    style.paragraph_format.space_after = Pt(0)
+    style.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
 
     for idx, (article, content) in enumerate(articles_with_content):
         # Article number header
         p = doc.add_paragraph()
         run = p.add_run(f"#{article['number']}")
         run.bold = True
-        run.font.size = Pt(12)
 
         # Blank line
         doc.add_paragraph()
