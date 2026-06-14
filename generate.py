@@ -20,8 +20,6 @@ from pathlib import Path
 
 import requests as http_req
 from openpyxl import load_workbook
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 from tqdm import tqdm
 
 try:
@@ -426,10 +424,144 @@ class DocBuilder:
 
 
 # ================================================================
-# Google Docs & Drive API
+# DOCX File Builder (no Google API needed)
 # ================================================================
+def _add_hyperlink_run(paragraph, text, url):
+    """Add a highlighted hyperlink run to a paragraph."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    part = paragraph.part
+    r_id = part.relate_to(
+        url,
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+        is_external=True,
+    )
+
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("r:id"), r_id)
+
+    run_el = OxmlElement("w:r")
+    rPr = OxmlElement("w:rPr")
+
+    # Blue text color
+    color = OxmlElement("w:color")
+    color.set(qn("w:val"), "0070C0")
+    rPr.append(color)
+
+    # Underline
+    u = OxmlElement("w:u")
+    u.set(qn("w:val"), "single")
+    rPr.append(u)
+
+    # Highlight (cyan/turquoise background)
+    hl = OxmlElement("w:highlight")
+    hl.set(qn("w:val"), "cyan")
+    rPr.append(hl)
+
+    run_el.append(rPr)
+
+    t = OxmlElement("w:t")
+    t.set(qn("xml:space"), "preserve")
+    t.text = text
+    run_el.append(t)
+
+    hyperlink.append(run_el)
+    paragraph._element.append(hyperlink)
+
+
+def _add_body_paragraph(doc, body, article):
+    """Add a body paragraph, replacing {{KW1}}/{{KW2}} with highlighted hyperlinks."""
+    p = doc.add_paragraph()
+
+    parts = re.split(r'(\{\{KW[12]\}\})', body)
+    for part in parts:
+        if part == "{{KW1}}" and article["keyword1"]:
+            _add_hyperlink_run(p, article["keyword1"], article["url1"])
+        elif part == "{{KW2}}" and article["keyword2"]:
+            _add_hyperlink_run(p, article["keyword2"], article["url2"])
+        elif part:
+            p.add_run(part)
+
+
+def build_docx_file(articles_with_content, output_path):
+    """Build a formatted .docx file from articles and their generated content.
+
+    Args:
+        articles_with_content: list of (article_dict, content_dict) tuples
+        output_path: path to save the .docx file
+    """
+    from docx import Document as DocxDocument
+    from docx.shared import Pt
+
+    doc = DocxDocument()
+
+    # Set default font
+    style = doc.styles["Normal"]
+    style.font.size = Pt(11)
+    style.font.name = "Arial"
+
+    for idx, (article, content) in enumerate(articles_with_content):
+        # Article number header
+        p = doc.add_paragraph()
+        run = p.add_run(f"#{article['number']}")
+        run.bold = True
+        run.font.size = Pt(12)
+
+        # Blank line
+        doc.add_paragraph()
+
+        # Keyword listing
+        p = doc.add_paragraph()
+        run = p.add_run("Keyword：")
+        run.bold = True
+
+        doc.add_paragraph()
+        doc.add_paragraph(f"● {article['keyword1']}")
+        if article["keyword2"]:
+            doc.add_paragraph(f"● {article['keyword2']}")
+
+        doc.add_paragraph()
+
+        # H1
+        p = doc.add_paragraph()
+        run = p.add_run(f"H1：{content['h1']}")
+        run.bold = True
+
+        doc.add_paragraph()
+
+        # Sections
+        for section in content["sections"]:
+            h2 = section.get("h2")
+            if h2:
+                p = doc.add_paragraph()
+                run = p.add_run(f"H2：{h2}")
+                run.bold = True
+                doc.add_paragraph()
+
+            body = section.get("body", "")
+            if body:
+                _add_body_paragraph(doc, body, article)
+
+            doc.add_paragraph()
+
+        # Page break between articles (except last)
+        if idx < len(articles_with_content) - 1:
+            from docx.oxml.ns import qn
+            from docx.oxml import OxmlElement
+
+            p = doc.add_paragraph()
+            run = p.add_run()
+            br = OxmlElement("w:br")
+            br.set(qn("w:type"), "page")
+            run._element.append(br)
+
+    doc.save(output_path)
+    return output_path
 def get_google_services(credentials_path):
     """Authenticate from JSON file and return Docs + Drive services."""
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
     creds = service_account.Credentials.from_service_account_file(
         credentials_path, scopes=SCOPES
     )
@@ -440,8 +572,9 @@ def get_google_services(credentials_path):
 
 def get_google_services_from_info(credentials_info):
     """Authenticate from dict (for Streamlit Cloud secrets) and return services."""
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
     info = dict(credentials_info)
-    # Fix escaped newlines in private_key (common in TOML secrets)
     if "private_key" in info:
         info["private_key"] = info["private_key"].replace("\\n", "\n")
     creds = service_account.Credentials.from_service_account_info(

@@ -1,10 +1,10 @@
 """
-Digital Zoo Linkbuild Generator — Web UI (Zero-Config Version)
-==============================================================
-所有認證由 Streamlit Cloud Secrets 管理，用戶只需上傳 Excel 即可。
+Digital Zoo Linkbuild Generator — Web UI
+=========================================
+生成 .docx 檔案，下載後拖入 Google Drive 即自動轉為 Google Doc。
+不需要任何 Google API 認證。
 
-Local testing:  streamlit run app.py
-Production:     Deploy to Streamlit Cloud
+streamlit run app.py
 """
 
 import os
@@ -22,65 +22,53 @@ st.set_page_config(
 from generate import (
     parse_excel,
     generate_article_content,
-    DocBuilder,
-    get_google_services_from_info,
-    create_formatted_doc,
+    build_docx_file,
     detect_language,
 )
 
 # ================================================================
-# Read secrets (all auth is server-side, users never see these)
+# Read secrets
 # ================================================================
 try:
     API_KEY = st.secrets["OPENROUTER_API_KEY"]
-    FOLDER_ID = st.secrets.get("GOOGLE_FOLDER_ID", "")
-    SHARE_EMAIL = st.secrets.get("SHARE_EMAIL", "")
-    MODEL = st.secrets.get("LB_MODEL", "deepseek/deepseek-v4-0324")
-    GOOGLE_CREDS = st.secrets["GOOGLE_CREDENTIALS"]
 except Exception:
-    st.error("⚠️ 伺服器設定未完成。請聯絡 Anson 設定 Streamlit Secrets。")
+    API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+
+if not API_KEY:
+    st.error("⚠️ 請設定 OPENROUTER_API_KEY（Streamlit Secrets 或環境變數）")
     st.stop()
 
-# ================================================================
-# Session state
-# ================================================================
-for key, default in {
-    "generated": [],
-    "failed": [],
-    "doc_url": None,
-    "running": False,
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+MODEL = os.environ.get("LB_MODEL", "")
+if not MODEL:
+    try:
+        MODEL = st.secrets.get("LB_MODEL", "deepseek/deepseek-chat-v3-0324")
+    except Exception:
+        MODEL = "deepseek/deepseek-chat-v3-0324"
 
 # ================================================================
 # UI
 # ================================================================
 st.title("🔗 DZ Linkbuild Generator")
-st.caption("上傳 Excel → 選擇 Batch → 自動生成格式化 Google Doc")
+st.caption("上傳 Excel → 選擇 Batch → 生成 .docx → 下載後拖入 Google Drive")
 
-# ── Step 1: Upload Excel ──
+# ── Step 1: Upload ──
 excel_file = st.file_uploader(
     "📊 上傳 Linkbuilding Excel",
     type=["xlsx"],
-    help="每月的 Internal Linkbuilding List",
 )
 
 if not excel_file:
     st.info("👆 請先上傳 Excel 檔案")
     st.stop()
 
-# Save upload to temp file
 with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
     tmp.write(excel_file.read())
     tmp_excel_path = tmp.name
 
-# Parse all batches
 try:
     from openpyxl import load_workbook
     wb = load_workbook(tmp_excel_path)
     sheet_name = wb.sheetnames[0]
-
     batch_counts = {}
     for b in range(1, 10):
         arts = parse_excel(tmp_excel_path, b, sheet_name)
@@ -95,7 +83,7 @@ if not batch_counts:
     st.error("在 Excel 中找不到任何 Batch 資料")
     st.stop()
 
-# ── Step 2: Select Batch & Range ──
+# ── Step 2: Select ──
 st.divider()
 col1, col2, col3 = st.columns([2, 1, 1])
 
@@ -127,7 +115,6 @@ with col3:
 
 filtered = [a for a in articles if start_num <= a["number"] <= end_num]
 
-# ── Preview ──
 with st.expander(f"📋 預覽（{len(filtered)} 篇）", expanded=False):
     preview_data = []
     for a in filtered:
@@ -144,35 +131,14 @@ with st.expander(f"📋 預覽（{len(filtered)} 篇）", expanded=False):
 # ── Step 3: Generate ──
 st.divider()
 
-col_a, col_b, col_spacer = st.columns([1, 1, 2])
-with col_a:
-    btn_generate = st.button(
-        "🚀 生成 Google Doc",
-        type="primary",
-        use_container_width=True,
-    )
-with col_b:
-    btn_dry = st.button(
-        "📝 Dry Run（預覽文字）",
-        use_container_width=True,
-    )
+if st.button("🚀 生成文章", type="primary", use_container_width=False):
 
-# ================================================================
-# Generation
-# ================================================================
-if btn_generate or btn_dry:
-    is_dry_run = btn_dry
+    articles_with_content = []
+    failed = []
 
-    st.session_state.generated = []
-    st.session_state.failed = []
-    st.session_state.doc_url = None
-
-    builder = DocBuilder()
     progress_bar = st.progress(0, text="準備中...")
     status_area = st.container()
-
     total = len(filtered)
-    success_count = 0
 
     for i, article in enumerate(filtered):
         num = article["number"]
@@ -185,73 +151,53 @@ if btn_generate or btn_dry:
         content = generate_article_content(article, API_KEY, MODEL)
 
         if content:
-            builder.build_article(article, content)
-            success_count += 1
-            st.session_state.generated.append({
-                "number": num,
-                "h1": content["h1"],
-            })
+            articles_with_content.append((article, content))
             with status_area:
                 st.success(f"✅ #{num} — {content['h1']}")
         else:
-            st.session_state.failed.append(num)
+            failed.append(num)
             with status_area:
                 st.error(f"❌ #{num} — 生成失敗")
 
         if i < total - 1:
             time.sleep(3)
 
-    progress_bar.progress(1.0, text=f"✅ 完成 {success_count}/{total} 篇")
+    progress_bar.progress(1.0, text=f"✅ 完成 {len(articles_with_content)}/{total} 篇")
 
-    # ── Output ──
-    st.divider()
+    # ── Build .docx ──
+    if articles_with_content:
+        st.divider()
 
-    if is_dry_run:
-        st.subheader("📝 文字預覽")
+        with st.spinner("📄 建立 Word 文件中..."):
+            filename = f"Combined_2026_May_Internal_Batch_{selected_batch}"
+            if start_num != first_num or end_num != last_num:
+                filename += f"_#{start_num}-{end_num}"
+            filename += ".docx"
+
+            with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp_docx:
+                build_docx_file(articles_with_content, tmp_docx.name)
+                tmp_docx_path = tmp_docx.name
+
+            with open(tmp_docx_path, "rb") as f:
+                docx_bytes = f.read()
+
+            os.unlink(tmp_docx_path)
+
+        st.balloons()
+        st.success(f"🎉 完成！已生成 {len(articles_with_content)} 篇文章。")
+
         st.download_button(
-            "⬇️ 下載 TXT",
-            data=builder.text.encode("utf-8"),
-            file_name=f"batch_{selected_batch}_preview.txt",
-            mime="text/plain",
+            label=f"⬇️ 下載 {filename}",
+            data=docx_bytes,
+            file_name=filename,
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            type="primary",
         )
-        with st.expander("預覽內容", expanded=True):
-            preview = builder.text[:5000]
-            if len(builder.text) > 5000:
-                preview += "\n\n... (更多內容請下載 TXT 檔案) ..."
-            st.text(preview)
 
-    else:
-        if success_count == 0:
-            st.error("所有文章都生成失敗，無法建立 Google Doc")
-        else:
-            with st.spinner("📄 建立 Google Doc 中..."):
-                try:
-                    docs_svc, drive_svc = get_google_services_from_info(GOOGLE_CREDS)
+        st.caption("💡 下載後將 .docx 拖入 Google Drive，會自動轉為 Google Doc 格式。")
 
-                    title = f"Combined_2026_May_Internal_Batch_{selected_batch}"
-                    if start_num != first_num or end_num != last_num:
-                        title += f"_#{start_num}-{end_num}"
-
-                    doc_id, doc_url = create_formatted_doc(
-                        docs_svc, drive_svc, builder, title,
-                        folder_id=FOLDER_ID or None,
-                        share_email=SHARE_EMAIL or None,
-                    )
-                    st.session_state.doc_url = doc_url
-
-                except Exception as e:
-                    st.error(f"Google Doc 建立失敗：{e}")
-
-            if st.session_state.doc_url:
-                st.balloons()
-                st.success("🎉 完成！Google Doc 已建立並分享到指定資料夾。")
-                st.markdown(f"### 📄 [打開 Google Doc]({st.session_state.doc_url})")
-
-    if st.session_state.failed:
-        st.warning(
-            f"⚠️ 以下文章生成失敗：{st.session_state.failed}。"
-            f"可調整範圍重新跑這些文章。"
-        )
+    if failed:
+        st.warning(f"⚠️ 失敗文章：{failed}。可調整範圍重新跑。")
 
 # Cleanup
 try:
