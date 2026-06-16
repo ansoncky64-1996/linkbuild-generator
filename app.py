@@ -37,9 +37,35 @@ if not API_KEY:
     st.stop()
 
 try:
-    MODEL = st.secrets.get("LB_MODEL", "deepseek/deepseek-chat-v3-0324")
+    MODEL = st.secrets.get("LB_MODEL", "deepseek/deepseek-v4-flash")
 except Exception:
-    MODEL = os.environ.get("LB_MODEL", "deepseek/deepseek-chat-v3-0324")
+    MODEL = os.environ.get("LB_MODEL", "deepseek/deepseek-v4-flash")
+
+
+# ================================================================
+# Cached Excel parsing (only runs ONCE per file, not on every click)
+# ================================================================
+@st.cache_data(show_spinner="📊 讀取 Excel 中...")
+def load_all_batches(file_bytes):
+    """Parse Excel once and cache results. Re-runs only when file changes."""
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(tmp_path)
+        sheet_name = wb.sheetnames[0]
+        batch_counts = {}
+        for b in range(1, 10):
+            arts = parse_excel(tmp_path, b, sheet_name)
+            if arts:
+                batch_counts[b] = arts
+        wb.close()
+        return batch_counts
+    finally:
+        os.unlink(tmp_path)
+
 
 # ================================================================
 # UI
@@ -54,29 +80,14 @@ if not excel_file:
     st.info("👆 請先上傳 Excel 檔案")
     st.stop()
 
-with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-    tmp.write(excel_file.read())
-    tmp_excel_path = tmp.name
-
-try:
-    from openpyxl import load_workbook
-    wb = load_workbook(tmp_excel_path)
-    sheet_name = wb.sheetnames[0]
-    batch_counts = {}
-    for b in range(1, 10):
-        arts = parse_excel(tmp_excel_path, b, sheet_name)
-        if arts:
-            batch_counts[b] = arts
-    wb.close()
-except Exception as e:
-    st.error(f"Excel 讀取失敗：{e}")
-    st.stop()
+# Parse (cached — instant on 2nd+ interaction)
+batch_counts = load_all_batches(excel_file.getvalue())
 
 if not batch_counts:
     st.error("找不到任何 Batch 資料")
     st.stop()
 
-# ── Select ──
+# ── Select (instant, no re-parsing) ──
 st.divider()
 col1, col2, col3 = st.columns([2, 1, 1])
 
@@ -108,7 +119,7 @@ with col3:
 
 filtered = [a for a in articles if start_num <= a["number"] <= end_num]
 
-# ── Preview table ──
+# ── Preview ──
 with st.expander(f"📋 預覽（{len(filtered)} 篇）", expanded=False):
     preview_data = []
     for a in filtered:
@@ -126,7 +137,7 @@ with st.expander(f"📋 預覽（{len(filtered)} 篇）", expanded=False):
 with st.expander("⚙️ 進階設定", expanded=False):
     parallel = st.slider(
         "同時生成篇數", 1, 5, 3,
-        help="同時呼叫 API 的數量。數字越大越快，但太高可能觸發 rate limit。",
+        help="同時呼叫 API 的數量。越大越快，但太高可能觸發 rate limit。",
     )
 
 # ── Buttons ──
@@ -157,7 +168,6 @@ if btn_generate or btn_dry:
     status_area = st.container()
 
     if parallel <= 1:
-        # Sequential
         for i, article in enumerate(filtered):
             num = article["number"]
             label = f"#{num}: {article['keyword1']}"
@@ -173,7 +183,6 @@ if btn_generate or btn_dry:
                 with status_area:
                     st.error(f"❌ #{num} — 生成失敗")
     else:
-        # Parallel
         done_count = 0
         with ThreadPoolExecutor(max_workers=parallel) as executor:
             futures = {
@@ -197,7 +206,6 @@ if btn_generate or btn_dry:
                     with status_area:
                         st.error(f"❌ #{num} — 生成失敗")
 
-        # Sort by article number (parallel results come in random order)
         articles_with_content.sort(key=lambda x: x[0]["number"])
 
     progress_bar.progress(1.0, text=f"✅ 完成 {len(articles_with_content)}/{total} 篇")
@@ -208,7 +216,6 @@ if btn_generate or btn_dry:
     if not articles_with_content:
         st.error("所有文章都生成失敗")
     elif is_dry_run:
-        # Text preview
         st.subheader("📝 文字預覽")
         for article, content in articles_with_content:
             with st.expander(f"#{article['number']} — {content['h1']}", expanded=False):
@@ -219,7 +226,6 @@ if btn_generate or btn_dry:
                     text += sec.get("body", "") + "\n\n"
                 st.text(text)
     else:
-        # Build .docx
         with st.spinner("📄 建立 Word 文件中..."):
             filename = f"Combined_Batch_{selected_batch}"
             if start_num != first_num or end_num != last_num:
@@ -247,8 +253,3 @@ if btn_generate or btn_dry:
 
     if failed:
         st.warning(f"⚠️ 失敗文章：{failed}")
-
-try:
-    os.unlink(tmp_excel_path)
-except Exception:
-    pass

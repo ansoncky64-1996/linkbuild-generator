@@ -32,7 +32,7 @@ except ImportError:
 # Configuration
 # ================================================================
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-MODEL = os.environ.get("LB_MODEL", "deepseek/deepseek-v4-0324")
+MODEL = os.environ.get("LB_MODEL", "deepseek/deepseek-v4-flash")
 DELAY_BETWEEN_CALLS = int(os.environ.get("LB_DELAY", "3"))
 
 # 藍色 highlight RGB（Google Docs 0-1 scale）
