@@ -89,35 +89,59 @@ if not batch_counts:
 
 # ── Select (instant, no re-parsing) ──
 st.divider()
-col1, col2, col3 = st.columns([2, 1, 1])
 
-with col1:
-    batch_options = list(batch_counts.keys())
-    batch_labels = [
-        f"Batch {b} — {len(arts)} 篇（#{arts[0]['number']}-#{arts[-1]['number']}）"
-        for b, arts in batch_counts.items()
-    ]
-    selected_idx = st.selectbox(
-        "📁 選擇 Batch",
-        range(len(batch_options)),
-        format_func=lambda i: batch_labels[i],
+batch_options = list(batch_counts.keys())
+batch_labels = [
+    f"Batch {b} — {len(arts)} 篇（#{arts[0]['number']}-#{arts[-1]['number']}）"
+    for b, arts in batch_counts.items()
+]
+selected_idx = st.selectbox(
+    "📁 選擇 Batch",
+    range(len(batch_options)),
+    format_func=lambda i: batch_labels[i],
+)
+selected_batch = batch_options[selected_idx]
+articles = batch_counts[selected_batch]
+
+first_num = articles[0]["number"]
+last_num = articles[-1]["number"]
+
+select_mode = st.radio(
+    "選擇方式",
+    ["📏 連續範圍", "🔢 指定文章編號"],
+    horizontal=True,
+)
+
+if select_mode == "📏 連續範圍":
+    col_s, col_e = st.columns(2)
+    with col_s:
+        start_num = st.number_input(
+            "起始 #", min_value=first_num, max_value=last_num, value=first_num,
+        )
+    with col_e:
+        end_num = st.number_input(
+            "結束 #", min_value=first_num, max_value=last_num, value=last_num,
+        )
+    filtered = [a for a in articles if start_num <= a["number"] <= end_num]
+else:
+    article_nums_input = st.text_input(
+        "輸入文章編號（用逗號分隔）",
+        placeholder=f"例如：{first_num}, {first_num+2}, {first_num+5}",
     )
-    selected_batch = batch_options[selected_idx]
-    articles = batch_counts[selected_batch]
-
-with col2:
-    first_num = articles[0]["number"]
-    last_num = articles[-1]["number"]
-    start_num = st.number_input(
-        "起始 #", min_value=first_num, max_value=last_num, value=first_num,
-    )
-
-with col3:
-    end_num = st.number_input(
-        "結束 #", min_value=first_num, max_value=last_num, value=last_num,
-    )
-
-filtered = [a for a in articles if start_num <= a["number"] <= end_num]
+    if article_nums_input:
+        try:
+            selected_nums = set(
+                int(n.strip()) for n in article_nums_input.split(",") if n.strip()
+            )
+            filtered = [a for a in articles if a["number"] in selected_nums]
+            not_found = selected_nums - {a["number"] for a in filtered}
+            if not_found:
+                st.warning(f"以下編號在此 Batch 中找不到：{sorted(not_found)}")
+        except ValueError:
+            st.error("格式錯誤，請輸入數字並用逗號分隔")
+            filtered = []
+    else:
+        filtered = []
 
 # ── Preview ──
 with st.expander(f"📋 預覽（{len(filtered)} 篇）", expanded=False):
@@ -142,11 +166,15 @@ with st.expander("⚙️ 進階設定", expanded=False):
 
 # ── Buttons ──
 st.divider()
+no_articles = len(filtered) == 0
 col_a, col_b, col_spacer = st.columns([1, 1, 2])
 with col_a:
-    btn_generate = st.button("🚀 生成文章", type="primary", use_container_width=True)
+    btn_generate = st.button("🚀 生成文章", type="primary", use_container_width=True, disabled=no_articles)
 with col_b:
-    btn_dry = st.button("📝 Dry Run（預覽文字）", use_container_width=True)
+    btn_dry = st.button("📝 Dry Run（預覽文字）", use_container_width=True, disabled=no_articles)
+
+if no_articles and select_mode == "🔢 指定文章編號":
+    st.info("👆 請輸入要生成的文章編號")
 
 
 # ================================================================
