@@ -356,7 +356,10 @@ def generate_article_content(article, api_key, model, max_retries=3):
             resp.raise_for_status()
             data = resp.json()
 
-            raw = data["choices"][0]["message"]["content"].strip()
+            content_raw = data["choices"][0]["message"].get("content")
+            if not content_raw:
+                raise ValueError("API returned empty content")
+            raw = content_raw.strip()
             # Strip markdown fences if present
             raw = re.sub(r'^```(?:json)?\s*', '', raw)
             raw = re.sub(r'\s*```$', '', raw)
