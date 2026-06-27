@@ -32,7 +32,7 @@ except ImportError:
 # Configuration
 # ================================================================
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-MODEL = os.environ.get("LB_MODEL", "z-ai/glm-5.2")
+MODEL = os.environ.get("LB_MODEL", "deepseek/deepseek-v4-flash")
 DELAY_BETWEEN_CALLS = int(os.environ.get("LB_DELAY", "3"))
 
 # 藍色 highlight RGB（Google Docs 0-1 scale）
@@ -225,8 +225,8 @@ def build_prompt(article):
 5. H1 和 H2 標題中不可包含關鍵字原文或其中任何部分
 6. {{{{KW1}}}} 和 {{{{KW2}}}} 所在位置必須與目標連結頁面主題高度相關
 7. 文章主題不可直接等於關鍵字，應找到一個能自然串聯兩個關鍵字的上層主題
-8. 中文文章至少 800 字，建議 900-1100 字；英文文章至少 800 words，建議 900-1200 words
-9. 段落長度適中，避免密集短句，每個 section 的 body 至少 120 字（中文）或 120 words（英文）
+8. 字數要求嚴格執行：中文文章至少 900 字（以漢字計算），建議 1000-1200 字；英文文章至少 900 words（以空格分隔的單詞計算），建議 1000-1200 words。字數不足會被退回重寫。
+9. 段落長度適中，避免密集短句，每個 section 的 body 至少 150 字（中文）或 150 words（英文）
 10. 只輸出 JSON，不要任何其他文字
 """
     return prompt
@@ -260,6 +260,75 @@ def _clean_keyword_duplicates(result, article):
         body = body.replace("\x00KW2\x00", "{{KW2}}")
 
         section["body"] = body
+
+    return result
+
+
+def _count_words(result, lang):
+    """Count total words in article body.
+    English: whitespace-separated words.
+    Chinese: character count (excluding punctuation/spaces).
+    """
+    all_text = ""
+    for section in result.get("sections", []):
+        body = section.get("body", "")
+        # Strip keyword markers for counting
+        body = body.replace("{{KW1}}", "").replace("{{KW2}}", "")
+        all_text += body + " "
+
+    if lang == "en":
+        return len(all_text.split())
+    else:
+        # Chinese: count CJK characters
+        return len(re.findall(r'[\u4e00-\u9fff]', all_text))
+
+
+def _expand_article(result, article, api_key, model, current_count, lang):
+    """Ask AI to expand a too-short article."""
+    min_target = 800 if lang == "en" else 850
+    unit = "words" if lang == "en" else "字"
+
+    current_json = json.dumps(result, ensure_ascii=False)
+
+    expand_prompt = f"""以下文章只有 {current_count} {unit}，未達到最低 {min_target} {unit} 的要求。
+
+請將每個 section 的 body 內容擴展加長，增加更多論述、例子和細節，使總字數達到至少 {min_target} {unit}。
+
+要求：
+- 保持完全相同的 JSON 結構、h1、h2 標題和 {{{{KW1}}}}/{{{{KW2}}}} 標記位置
+- 不要增加或減少 section 數量
+- 不要修改 h1 或 h2 標題
+- 只擴展 body 內容，讓每段更充實
+- 輸出完整的 JSON，不要加 markdown code fence
+
+原文 JSON：
+{current_json}"""
+
+    try:
+        resp = http_req.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": expand_prompt}],
+                "temperature": 0.7,
+                "max_tokens": 8000,
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        raw = data["choices"][0]["message"]["content"].strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+        expanded = json.loads(raw)
+        if "sections" in expanded and len(expanded["sections"]) >= 3:
+            return expanded
+    except Exception as e:
+        print(f"  ⚠ Expansion failed: {e}")
 
     return result
 
@@ -301,6 +370,23 @@ def generate_article_content(article, api_key, model, max_retries=3):
 
             # Post-process: remove keyword duplicates outside markers
             result = _clean_keyword_duplicates(result, article)
+
+            # Validate word count — expand if too short
+            lang = detect_language(
+                article.get("keyword1", "") + article.get("keyword2", "")
+            )
+            word_count = _count_words(result, lang)
+            min_words = 750
+
+            if word_count < min_words:
+                unit = "words" if lang == "en" else "字"
+                print(f"  ⚠ Only {word_count} {unit}, expanding...")
+                result = _expand_article(
+                    result, article, api_key, model, word_count, lang
+                )
+                result = _clean_keyword_duplicates(result, article)
+                new_count = _count_words(result, lang)
+                print(f"  → Expanded to {new_count} {unit}")
 
             return result
 
