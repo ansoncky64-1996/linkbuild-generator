@@ -256,8 +256,9 @@ if btn_generate or btn_dry:
     else:
         with st.spinner("📄 建立 Word 文件中..."):
             filename = f"Combined_Batch_{selected_batch}"
-            if start_num != first_num or end_num != last_num:
-                filename += f"_#{start_num}-{end_num}"
+            if len(filtered) < len(articles):
+                nums = [a["number"] for a in filtered]
+                filename += f"_#{nums[0]}-{nums[-1]}" if len(nums) > 2 else f"_#{'_#'.join(str(n) for n in nums)}"
             filename += ".docx"
 
             with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp_docx:
