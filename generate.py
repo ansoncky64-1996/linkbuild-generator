@@ -218,17 +218,50 @@ def build_prompt(article):
 }}
 
 ### 重要規則
-1. {{{{KW1}}}} 和 {{{{KW2}}}} 各只能出現一次
-2. 兩個標記不可在同一 section
-3. 標記不可在第一個 section（開篇段落）或最後一個 section
-4. H1 和 H2 標題中不可包含關鍵字原文
-5. {{{{KW1}}}} 和 {{{{KW2}}}} 所在位置必須與目標連結頁面主題高度相關
-6. 文章主題不可直接等於關鍵字，應找到一個能自然串聯兩個關鍵字的上層主題
-7. 至少 750 字，建議 800-1000 字
-8. 段落長度適中，避免密集短句
-9. 只輸出 JSON，不要任何其他文字
+1. {{{{KW1}}}} 和 {{{{KW2}}}} 各只能出現一次，且必須使用標記形式
+2. 關鍵字的原文（包括部分匹配）不可在標記以外的任何位置出現。例如關鍵字是「迷你倉 推介」，則正文其他段落不可出現「迷你倉」或「推介迷你倉」等字眼。如需提及相關概念，必須用同義詞或改寫方式表達（例如用「小型倉儲」代替「迷你倉」）
+3. 兩個標記不可在同一 section
+4. 標記不可在第一個 section（開篇段落）或最後一個 section
+5. H1 和 H2 標題中不可包含關鍵字原文或其中任何部分
+6. {{{{KW1}}}} 和 {{{{KW2}}}} 所在位置必須與目標連結頁面主題高度相關
+7. 文章主題不可直接等於關鍵字，應找到一個能自然串聯兩個關鍵字的上層主題
+8. 中文文章至少 800 字，建議 900-1100 字；英文文章至少 800 words，建議 900-1200 words
+9. 段落長度適中，避免密集短句，每個 section 的 body 至少 120 字（中文）或 120 words（英文）
+10. 只輸出 JSON，不要任何其他文字
 """
     return prompt
+
+
+def _clean_keyword_duplicates(result, article):
+    """Remove keyword text that appears outside of {{KW1}}/{{KW2}} markers."""
+    kw1 = article.get("keyword1", "").strip()
+    kw2 = article.get("keyword2", "").strip()
+
+    for section in result["sections"]:
+        body = section.get("body", "")
+        if not body:
+            continue
+
+        # Temporarily replace markers with placeholders
+        body = body.replace("{{KW1}}", "\x00KW1\x00")
+        body = body.replace("{{KW2}}", "\x00KW2\x00")
+
+        # Remove bare keyword occurrences (case-insensitive for English)
+        if kw1:
+            body = re.sub(re.escape(kw1), "", body, flags=re.IGNORECASE)
+        if kw2:
+            body = re.sub(re.escape(kw2), "", body, flags=re.IGNORECASE)
+
+        # Clean up double spaces left by removal
+        body = re.sub(r'  +', ' ', body)
+
+        # Restore markers
+        body = body.replace("\x00KW1\x00", "{{KW1}}")
+        body = body.replace("\x00KW2\x00", "{{KW2}}")
+
+        section["body"] = body
+
+    return result
 
 
 def generate_article_content(article, api_key, model, max_retries=3):
@@ -247,7 +280,7 @@ def generate_article_content(article, api_key, model, max_retries=3):
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.7,
-                    "max_tokens": 4000,
+                    "max_tokens": 6000,
                 },
                 timeout=120,
             )
@@ -265,6 +298,9 @@ def generate_article_content(article, api_key, model, max_retries=3):
             assert "h1" in result, "Missing h1"
             assert "sections" in result, "Missing sections"
             assert len(result["sections"]) >= 3, "Need at least 3 sections"
+
+            # Post-process: remove keyword duplicates outside markers
+            result = _clean_keyword_duplicates(result, article)
 
             return result
 
