@@ -225,7 +225,7 @@ def build_prompt(article):
 5. H1 和 H2 標題中不可包含關鍵字原文或其中任何部分
 6. {{{{KW1}}}} 和 {{{{KW2}}}} 所在位置必須與目標連結頁面主題高度相關
 7. 文章主題不可直接等於關鍵字，應找到一個能自然串聯兩個關鍵字的上層主題
-8. 字數要求嚴格執行：中文文章至少 900 字（以漢字計算），建議 1000-1200 字；英文文章至少 900 words（以空格分隔的單詞計算），建議 1000-1200 words。字數不足會被退回重寫。
+8. 字數要求嚴格執行：中文文章 800-1100 字（以漢字計算）；英文文章 800-1000 words（以空格分隔的單詞計算）。字數不足或超出都會被退回重寫。
 9. 段落長度適中，避免密集短句，每個 section 的 body 至少 150 字（中文）或 150 words（英文）
 10. 只輸出 JSON，不要任何其他文字
 """
@@ -333,6 +333,59 @@ def _expand_article(result, article, api_key, model, current_count, lang):
     return result
 
 
+def _condense_article(result, article, api_key, model, current_count, lang):
+    """Ask AI to condense an article that exceeds the word limit."""
+    max_target = 1000 if lang == "en" else 1100
+    unit = "words" if lang == "en" else "字"
+
+    current_json = json.dumps(result, ensure_ascii=False)
+
+    condense_prompt = f"""以下文章有 {current_count} {unit}，超出了上限 {max_target} {unit}。
+
+請精簡每個 section 的 body 內容，刪除冗餘的描述和重複的論點，使總字數控制在 {max_target} {unit} 以內。
+
+要求：
+- 保持完全相同的 JSON 結構、h1、h2 標題和 {{{{KW1}}}}/{{{{KW2}}}} 標記位置
+- 不要增加或減少 section 數量
+- 不要修改 h1 或 h2 標題
+- 保留核心論點，只刪減多餘的修飾和重複內容
+- 輸出完整的 JSON，不要加 markdown code fence
+
+原文 JSON：
+{current_json}"""
+
+    try:
+        resp = http_req.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": condense_prompt}],
+                "temperature": 0.5,
+                "max_tokens": 6000,
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content_raw = data["choices"][0]["message"].get("content")
+        if not content_raw:
+            return result
+        raw = content_raw.strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+        condensed = json.loads(raw)
+        if "sections" in condensed and len(condensed["sections"]) >= 3:
+            return condensed
+    except Exception as e:
+        print(f"  ⚠ Condensation failed: {e}")
+
+    return result
+
+
 def generate_article_content(article, api_key, model, max_retries=3):
     """Call OpenRouter API to generate article content."""
     prompt = build_prompt(article)
@@ -374,15 +427,16 @@ def generate_article_content(article, api_key, model, max_retries=3):
             # Post-process: remove keyword duplicates outside markers
             result = _clean_keyword_duplicates(result, article)
 
-            # Validate word count — expand if too short
+            # Validate word count — expand if too short, condense if too long
             lang = detect_language(
                 article.get("keyword1", "") + article.get("keyword2", "")
             )
             word_count = _count_words(result, lang)
             min_words = 750
+            max_words = 1000 if lang == "en" else 1100
+            unit = "words" if lang == "en" else "字"
 
             if word_count < min_words:
-                unit = "words" if lang == "en" else "字"
                 print(f"  ⚠ Only {word_count} {unit}, expanding...")
                 result = _expand_article(
                     result, article, api_key, model, word_count, lang
@@ -390,6 +444,14 @@ def generate_article_content(article, api_key, model, max_retries=3):
                 result = _clean_keyword_duplicates(result, article)
                 new_count = _count_words(result, lang)
                 print(f"  → Expanded to {new_count} {unit}")
+            elif word_count > max_words:
+                print(f"  ⚠ {word_count} {unit} exceeds {max_words}, condensing...")
+                result = _condense_article(
+                    result, article, api_key, model, word_count, lang
+                )
+                result = _clean_keyword_duplicates(result, article)
+                new_count = _count_words(result, lang)
+                print(f"  → Condensed to {new_count} {unit}")
 
             return result
 
