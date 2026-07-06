@@ -455,7 +455,7 @@ def generate_article_content(article, api_key, model, max_retries=3):
 
             return result
 
-        except (json.JSONDecodeError, AssertionError, KeyError) as e:
+        except (json.JSONDecodeError, AssertionError, KeyError, ValueError) as e:
             print(f"  ⚠ Attempt {attempt+1} parse error: {e}")
             if attempt < max_retries - 1:
                 time.sleep(5)
