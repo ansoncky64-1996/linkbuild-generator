@@ -47,29 +47,30 @@ SCOPES = [
 # Writing Guidelines (injected into AI prompt)
 # ================================================================
 WRITING_GUIDELINES = """
-## 反向連結文章寫作指引
+## DZ Linkbuilding Compliance Ruleset
 
-### 字數要求
-下限 750 至 1000 字
+### Word / Character Count
+- Chinese articles: 750–1,000 Chinese characters (body content only, excluding headings)
+- English articles: 750–1,000 words (space-separated, body content only)
 
-### 內容書寫原則
-- 寫作以網絡媒體文章為標準，成品愈接近這類文章愈理想。
-- 如有兩個關鍵字，應構思一個能觸及兩個關鍵字主題的主題，內容盡量能關聯兩個關鍵字。
-- 不應該直接以關鍵字為主題，因有可能最終令文章排名比客戶的目標連結頁面更高。
+### Content Principles
+- The thematic angle must be broader than either keyword to avoid cannibalization of client target pages.
+- Write as online media content — natural, editorial, not promotional.
 
-### 目標關鍵字與連結位置規則
-- 在正文中首次出現「完全符合關鍵字」時標記。
-- 連結必須放置在與目標頁面內容高度相關的上下文中。
-- 不可將兩個關鍵字放在同一段落，也不可安排在前段尾部與後段開首緊接出現。
-- 關鍵字不應加到全文的第一段或最後一段。
-- H1 與 H2 標題中不可出現關鍵字。
+### Heading Rules
+- H1: Under 30 full-width characters (Chinese) or 60 ASCII characters (English); no punctuation; must not contain any keyword
+- Exactly four H2s per article; bold; must not contain any keyword; no H3s
+- Structure: opening paragraph (no H2) → H2 → H2 → H2 → H2
 
-### 標題與段落格式
-- H1 標題需在 30 個全形字（或 60 字元）以內，不可有標點符號
-- H1 中絕對不可出現與客戶目標頁面完全相同的「目標關鍵字」
-- 不使用 H3
-- 不應全篇都使用 Bullet Point
-- 避免以密集的短句作分段，建議結合成段落
+### Keyword Placement Rules
+- Each keyword appears exactly once in body text (as a hyperlink marker)
+- Keywords must NOT appear in: any H1 or H2 heading, the opening paragraph, or the closing paragraph
+- Keywords must be separated by at least one full clean buffer paragraph (not in adjacent sections)
+- The keyword text (including partial matches) must not appear anywhere else in the article outside the single marked occurrence
+
+### Style
+- No bullet-point-only articles; bullets supplement narrative paragraphs, not replace them
+- Avoid dense short-sentence paragraphs; combine into flowing paragraphs
 """
 
 
@@ -158,12 +159,16 @@ def build_prompt(article):
 - 使用繁體中文書面語撰寫，語體風格對標香港主流網絡媒體（如《香港01》、《經濟日報》副刊）
 - 嚴禁使用廣東話口語、粵語語助詞或任何口語化表達（例如「嘅」「咗」「啲」「點解」「攞」「揀」「搞掂」「嚟」等）
 - 用詞正式但自然，語氣平實而有深度，行文要流暢，段落之間要有邏輯銜接
-- 用「的」不用「嘅」，用「了」不用「咗」，用「一些」不用「啲」，用「為什麼」不用「點解」"""
+- 用「的」不用「嘅」，用「了」不用「咗」，用「一些」不用「啲」，用「為什麼」不用「點解」
+- 目標字數：850–950 個漢字（正文內容）"""
+        count_instruction = "目標字數 850-950 個漢字"
     else:
         lang_instruction = """Language requirements:
 - Write in fluent, professional English suitable for online media
 - Maintain a formal but accessible tone, similar to quality editorial content
-- Ensure logical flow between paragraphs with smooth transitions"""
+- Ensure logical flow between paragraphs with smooth transitions
+- Target word count: 850–950 words (body content)"""
+        count_instruction = "Target: 850-950 words"
 
     # Build keyword section
     if kw2:
@@ -171,12 +176,12 @@ def build_prompt(article):
 - 關鍵字 1: 「{kw1}」（目標連結: {url1}）
 - 關鍵字 2: 「{kw2}」（目標連結: {url2}）
 
-文章需同時觸及兩個關鍵字的主題。在正文中，用 {{{{KW1}}}} 標記關鍵字 1 首次出現的位置，用 {{{{KW2}}}} 標記關鍵字 2 首次出現的位置。"""
+文章需同時觸及兩個關鍵字的主題。用 {{{{KW1}}}} 標記關鍵字 1 出現位置，用 {{{{KW2}}}} 標記關鍵字 2 出現位置。"""
     else:
         kw_section = f"""目標關鍵字：
 - 關鍵字 1: 「{kw1}」（目標連結: {url1}）
 
-在正文中，用 {{{{KW1}}}} 標記關鍵字 1 首次出現的位置。"""
+用 {{{{KW1}}}} 標記關鍵字 1 出現位置。"""
 
     prompt = f"""你是一位專業的 SEO 內容寫手。請根據以下指引撰寫一篇反向連結文章。
 
@@ -191,12 +196,13 @@ def build_prompt(article):
 網站類別 / 口吻: {category}
 {lang_instruction}
 
-### 輸出格式
+### 輸出格式（嚴格遵守）
 
-請嚴格以下列 JSON 格式輸出（不要加 markdown code fence）：
+JSON 結構必須剛好有 5 個 sections：1 個開篇（h2 為 null）+ 4 個 H2 section。
+{count_instruction}
 
 {{
-  "h1": "文章標題（30全形字內，無標點，不含關鍵字）",
+  "h1": "標題（30全形字/60字元內，無標點，不含關鍵字）",
   "sections": [
     {{
       "h2": null,
@@ -204,30 +210,33 @@ def build_prompt(article):
     }},
     {{
       "h2": "第一個 H2 標題（不含關鍵字）",
-      "body": "段落正文...在適當上下文中嵌入 {{{{KW1}}}}...後續內容"
+      "body": "正文段落...可在此嵌入 {{{{KW1}}}}..."
     }},
     {{
       "h2": "第二個 H2 標題（不含關鍵字）",
-      "body": "段落正文...在適當上下文中嵌入 {{{{KW2}}}}...後續內容"
+      "body": "緩衝段落（不含任何關鍵字）"
     }},
     {{
-      "h2": "結尾 H2 標題",
-      "body": "總結段落（不含關鍵字）"
+      "h2": "第三個 H2 標題（不含關鍵字）",
+      "body": "正文段落...可在此嵌入 {{{{KW2}}}}..."
+    }},
+    {{
+      "h2": "第四個 H2 標題（不含關鍵字）",
+      "body": "結尾段落（不含關鍵字）"
     }}
   ]
 }}
 
-### 重要規則
-1. {{{{KW1}}}} 和 {{{{KW2}}}} 各只能出現一次，且必須使用標記形式
-2. 關鍵字的原文（包括部分匹配）不可在標記以外的任何位置出現。例如關鍵字是「迷你倉 推介」，則正文其他段落不可出現「迷你倉」或「推介迷你倉」等字眼。如需提及相關概念，必須用同義詞或改寫方式表達（例如用「小型倉儲」代替「迷你倉」）
-3. 兩個標記不可在同一 section
-4. 標記不可在第一個 section（開篇段落）或最後一個 section
-5. H1 和 H2 標題中不可包含關鍵字原文或其中任何部分
-6. {{{{KW1}}}} 和 {{{{KW2}}}} 所在位置必須與目標連結頁面主題高度相關
-7. 文章主題不可直接等於關鍵字，應找到一個能自然串聯兩個關鍵字的上層主題
-8. 字數要求嚴格執行：中文文章 800-1100 字（以漢字計算）；英文文章 800-1000 words（以空格分隔的單詞計算）。字數不足或超出都會被退回重寫。
-9. 段落長度適中，避免密集短句，每個 section 的 body 至少 150 字（中文）或 150 words（英文）
-10. 只輸出 JSON，不要任何其他文字
+### 重要規則（違反任何一條都會被退回）
+1. {{{{KW1}}}} 和 {{{{KW2}}}} 各只出現一次，必須使用標記形式
+2. 關鍵字原文（包括部分匹配）不可在標記以外的任何位置出現。如需提及相關概念，必須用同義詞改寫
+3. 兩個標記之間必須隔至少一個完整的無關鍵字 section（緩衝段落）
+4. 標記不可在第一個 section（開篇）或最後一個 section（結尾）
+5. H1 和所有 H2 標題中不可包含關鍵字原文或其任何部分
+6. 必須剛好 5 個 sections（1 個開篇 + 4 個 H2），不可多不可少
+7. 文章主題不可直接等於關鍵字，必須找一個更上層的主題角度
+8. 每個 section body 至少 120 字/words，段落要充實
+9. 只輸出 JSON，不要任何其他文字或 code fence
 """
     return prompt
 
@@ -285,7 +294,7 @@ def _count_words(result, lang):
 
 def _expand_article(result, article, api_key, model, current_count, lang):
     """Ask AI to expand a too-short article."""
-    min_target = 800 if lang == "en" else 850
+    min_target = 800
     unit = "words" if lang == "en" else "字"
 
     current_json = json.dumps(result, ensure_ascii=False)
@@ -335,7 +344,7 @@ def _expand_article(result, article, api_key, model, current_count, lang):
 
 def _condense_article(result, article, api_key, model, current_count, lang):
     """Ask AI to condense an article that exceeds the word limit."""
-    max_target = 1000 if lang == "en" else 1100
+    max_target = 1000
     unit = "words" if lang == "en" else "字"
 
     current_json = json.dumps(result, ensure_ascii=False)
@@ -422,7 +431,11 @@ def generate_article_content(article, api_key, model, max_retries=3):
             # Validate structure
             assert "h1" in result, "Missing h1"
             assert "sections" in result, "Missing sections"
-            assert len(result["sections"]) >= 3, "Need at least 3 sections"
+            assert len(result["sections"]) == 5, f"Need exactly 5 sections (got {len(result['sections'])})"
+            # Verify H2 structure: first section h2=null, rest have h2
+            assert result["sections"][0].get("h2") is None, "First section must have h2=null"
+            for idx in range(1, 5):
+                assert result["sections"][idx].get("h2"), f"Section {idx} missing H2 title"
 
             # Post-process: remove keyword duplicates outside markers
             result = _clean_keyword_duplicates(result, article)
@@ -433,7 +446,7 @@ def generate_article_content(article, api_key, model, max_retries=3):
             )
             word_count = _count_words(result, lang)
             min_words = 750
-            max_words = 1000 if lang == "en" else 1100
+            max_words = 1000
             unit = "words" if lang == "en" else "字"
 
             if word_count < min_words:
@@ -722,7 +735,7 @@ def build_docx_file(articles_with_content, output_path):
 
         # H1
         p = doc.add_paragraph()
-        run = p.add_run(f"H1：{content['h1']}")
+        run = p.add_run(f"H1: {content['h1']}")
         run.bold = True
 
         doc.add_paragraph()
@@ -732,7 +745,7 @@ def build_docx_file(articles_with_content, output_path):
             h2 = section.get("h2")
             if h2:
                 p = doc.add_paragraph()
-                run = p.add_run(f"H2：{h2}")
+                run = p.add_run(f"H2: {h2}")
                 run.bold = True
                 doc.add_paragraph()
 
