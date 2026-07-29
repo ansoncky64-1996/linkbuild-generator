@@ -37,9 +37,9 @@ if not API_KEY:
     st.stop()
 
 try:
-    MODEL = st.secrets.get("LB_MODEL", "deepseek/deepseek-v4-flash")
+    MODEL = st.secrets.get("LB_MODEL", "qwen/qwen3.7-flash")
 except Exception:
-    MODEL = os.environ.get("LB_MODEL", "deepseek/deepseek-v4-flash")
+    MODEL = os.environ.get("LB_MODEL", "qwen/qwen3.7-flash")
 
 
 # ================================================================
