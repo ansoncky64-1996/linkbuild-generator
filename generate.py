@@ -32,7 +32,7 @@ except ImportError:
 # Configuration
 # ================================================================
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-MODEL = os.environ.get("LB_MODEL", "qwen/qwen3.7-flash")
+MODEL = os.environ.get("LB_MODEL", "deepseek/deepseek-v4-flash")
 DELAY_BETWEEN_CALLS = int(os.environ.get("LB_DELAY", "3"))
 
 # 藍色 highlight RGB（Google Docs 0-1 scale）
@@ -136,9 +136,13 @@ def parse_excel(filepath, batch_number, sheet_name="202605"):
 # Language Detection
 # ================================================================
 def detect_language(text):
-    """Detect if text is primarily Chinese or English."""
-    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
-    return "zh-HK" if chinese_chars > len(text) * 0.3 else "en"
+    """Detect article language from keywords.
+
+    Rule: if the keywords contain ANY Chinese character, the article is Chinese.
+    Only pure-English keywords produce an English article.
+    """
+    has_chinese = bool(re.search(r'[\u4e00-\u9fff]', text))
+    return "zh-HK" if has_chinese else "en"
 
 
 # ================================================================
@@ -156,8 +160,10 @@ def build_prompt(article):
 
     if lang == "zh-HK":
         lang_instruction = """語言要求：
+- 必須使用繁體中文（香港標準字形），嚴禁出現任何簡體字
 - 使用繁體中文書面語撰寫，語體風格對標香港主流網絡媒體（如《香港01》、《經濟日報》副刊）
 - 嚴禁使用廣東話口語、粵語語助詞或任何口語化表達（例如「嘅」「咗」「啲」「點解」「攞」「揀」「搞掂」「嚟」等）
+- 嚴禁使用破折號（—、–、――），改用逗號、句號或改寫句子結構
 - 用詞正式但自然，語氣平實而有深度，行文要流暢，段落之間要有邏輯銜接
 - 用「的」不用「嘅」，用「了」不用「咗」，用「一些」不用「啲」，用「為什麼」不用「點解」
 - 目標字數：850–950 個漢字（正文內容）"""
@@ -166,6 +172,7 @@ def build_prompt(article):
         lang_instruction = """Language requirements:
 - Write in fluent, professional English suitable for online media
 - Maintain a formal but accessible tone, similar to quality editorial content
+- Do NOT use em-dashes or en-dashes (—, –). Use commas, periods, or restructure the sentence instead
 - Ensure logical flow between paragraphs with smooth transitions
 - Target word count: 850–950 words (body content)"""
         count_instruction = "Target: 850-950 words"
@@ -241,6 +248,48 @@ JSON 結構必須剛好有 5 個 sections：1 個開篇（h2 為 null）+ 4 個 
     return prompt
 
 
+def _to_traditional(text):
+    """Convert any Simplified Chinese characters to Hong Kong Traditional."""
+    if not text:
+        return text
+    try:
+        from opencc import OpenCC
+        return OpenCC("s2hk").convert(text)
+    except Exception:
+        return text
+
+
+def _remove_dashes(text):
+    """Replace em-dashes / en-dashes with appropriate punctuation."""
+    if not text:
+        return text
+    # Em-dash and en-dash variants → comma (Chinese) or comma+space (English)
+    text = re.sub(r'\s*[—–―]{1,2}\s*', lambda m: '，' if re.search(
+        r'[\u4e00-\u9fff]', text) else ', ', text)
+    # Double hyphen used as dash
+    text = re.sub(r'\s+--\s+', ', ', text)
+    return text
+
+
+def _normalize_output(result, lang):
+    """Apply Traditional Chinese conversion and dash removal to all text fields."""
+    def clean(s):
+        if not s:
+            return s
+        s = _remove_dashes(s)
+        if lang == "zh-HK":
+            s = _to_traditional(s)
+        return s
+
+    result["h1"] = clean(result.get("h1", ""))
+    for section in result.get("sections", []):
+        if section.get("h2"):
+            section["h2"] = clean(section["h2"])
+        if section.get("body"):
+            section["body"] = clean(section["body"])
+    return result
+
+
 def _clean_keyword_duplicates(result, article):
     """Remove keyword text that appears outside of {{KW1}}/{{KW2}} markers."""
     kw1 = article.get("keyword1", "").strip()
@@ -269,6 +318,38 @@ def _clean_keyword_duplicates(result, article):
         body = body.replace("\x00KW2\x00", "{{KW2}}")
 
         section["body"] = body
+
+    # Enforce exactly ONE occurrence of each marker across the whole article
+    for marker in ("{{KW1}}", "{{KW2}}"):
+        seen = False
+        for section in result["sections"]:
+            body = section.get("body", "")
+            if marker not in body:
+                continue
+            if not seen:
+                # Keep the first occurrence, drop any extras in this same body
+                first_idx = body.index(marker)
+                head = body[:first_idx + len(marker)]
+                tail = body[first_idx + len(marker):].replace(marker, "")
+                section["body"] = head + tail
+                seen = True
+            else:
+                # Already placed earlier — strip all occurrences here
+                section["body"] = body.replace(marker, "")
+
+    # Strip keywords from H1 and H2 headings
+    for kw in (kw1, kw2):
+        if not kw:
+            continue
+        if result.get("h1"):
+            result["h1"] = re.sub(
+                re.escape(kw), "", result["h1"], flags=re.IGNORECASE
+            ).strip()
+        for section in result["sections"]:
+            if section.get("h2"):
+                section["h2"] = re.sub(
+                    re.escape(kw), "", section["h2"], flags=re.IGNORECASE
+                ).strip()
 
     return result
 
@@ -440,10 +521,13 @@ def generate_article_content(article, api_key, model, max_retries=3):
             # Post-process: remove keyword duplicates outside markers
             result = _clean_keyword_duplicates(result, article)
 
-            # Validate word count — expand if too short, condense if too long
+            # Normalize: Traditional Chinese + remove dashes
             lang = detect_language(
                 article.get("keyword1", "") + article.get("keyword2", "")
             )
+            result = _normalize_output(result, lang)
+
+            # Validate word count — expand if too short, condense if too long
             word_count = _count_words(result, lang)
             min_words = 750
             max_words = 1000
@@ -455,6 +539,7 @@ def generate_article_content(article, api_key, model, max_retries=3):
                     result, article, api_key, model, word_count, lang
                 )
                 result = _clean_keyword_duplicates(result, article)
+                result = _normalize_output(result, lang)
                 new_count = _count_words(result, lang)
                 print(f"  → Expanded to {new_count} {unit}")
             elif word_count > max_words:
@@ -463,6 +548,7 @@ def generate_article_content(article, api_key, model, max_retries=3):
                     result, article, api_key, model, word_count, lang
                 )
                 result = _clean_keyword_duplicates(result, article)
+                result = _normalize_output(result, lang)
                 new_count = _count_words(result, lang)
                 print(f"  → Condensed to {new_count} {unit}")
 
