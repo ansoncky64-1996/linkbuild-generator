@@ -32,7 +32,7 @@ except ImportError:
 # Configuration
 # ================================================================
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-MODEL = os.environ.get("LB_MODEL", "~deepseek/deepseek-v4-flash-latest")
+MODEL = os.environ.get("LB_MODEL", "deepseek/deepseek-v4-flash")
 DELAY_BETWEEN_CALLS = int(os.environ.get("LB_DELAY", "3"))
 
 # 藍色 highlight RGB（Google Docs 0-1 scale）
@@ -291,11 +291,63 @@ def _normalize_output(result, lang):
 
 
 def _clean_keyword_duplicates(result, article):
-    """Remove keyword text that appears outside of {{KW1}}/{{KW2}} markers."""
+    """Ensure each keyword appears exactly once, as a {{KW1}}/{{KW2}} marker.
+
+    If the AI wrote the keyword as plain text without a marker, the first
+    occurrence is promoted to a marker so the hyperlink is never lost.
+    """
     kw1 = article.get("keyword1", "").strip()
     kw2 = article.get("keyword2", "").strip()
+    sections = result["sections"]
+    n = len(sections)
 
-    for section in result["sections"]:
+    # Step 1: for each keyword, make sure a marker exists somewhere.
+    # If not, promote the first bare occurrence (preferring middle sections).
+    for marker, kw in (("{{KW1}}", kw1), ("{{KW2}}", kw2)):
+        if not kw:
+            continue
+
+        has_marker = any(marker in s.get("body", "") for s in sections)
+        if has_marker:
+            continue
+
+        # Prefer sections that are not the first (intro) or last (closing)
+        candidate_order = list(range(1, max(1, n - 1))) + [0, n - 1]
+        promoted = False
+        for idx in candidate_order:
+            if idx >= n:
+                continue
+            body = sections[idx].get("body", "")
+            match = re.search(re.escape(kw), body, flags=re.IGNORECASE)
+            if match:
+                sections[idx]["body"] = (
+                    body[:match.start()] + marker + body[match.end():]
+                )
+                promoted = True
+                break
+
+        # Still nothing? Append the marker to a middle section so the
+        # hyperlink is not silently dropped. Avoid the section already
+        # holding the other marker so the buffer rule is preserved.
+        if not promoted:
+            other = "{{KW2}}" if marker == "{{KW1}}" else "{{KW1}}"
+            used_idx = next(
+                (i for i, s in enumerate(sections) if other in s.get("body", "")),
+                None,
+            )
+            middle = [i for i in range(1, max(1, n - 1)) if i != used_idx]
+            target = middle[0] if middle else (1 if n > 2 else 0)
+            if used_idx is not None and len(middle) > 1:
+                # Prefer a section at least 2 apart for a clean buffer
+                far = [i for i in middle if abs(i - used_idx) >= 2]
+                if far:
+                    target = far[0]
+            body = sections[target].get("body", "")
+            sep = "" if body.endswith(("。", ".", "！", "!", "？", "?")) else "。"
+            sections[target]["body"] = f"{body}{sep}{marker}"
+
+    # Step 2: strip every remaining bare occurrence outside the markers.
+    for section in sections:
         body = section.get("body", "")
         if not body:
             continue
@@ -551,6 +603,13 @@ def generate_article_content(article, api_key, model, max_retries=3):
                 result = _normalize_output(result, lang)
                 new_count = _count_words(result, lang)
                 print(f"  → Condensed to {new_count} {unit}")
+
+            # Final safety check: every keyword must have its marker present
+            all_bodies = " ".join(s.get("body", "") for s in result["sections"])
+            if article.get("keyword1") and "{{KW1}}" not in all_bodies:
+                raise AssertionError("KW1 marker missing after processing")
+            if article.get("keyword2") and "{{KW2}}" not in all_bodies:
+                raise AssertionError("KW2 marker missing after processing")
 
             return result
 
