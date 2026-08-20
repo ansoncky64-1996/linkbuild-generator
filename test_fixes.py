@@ -263,6 +263,33 @@ check("h2 schema 容許 null",
 check("max_tokens 預設由 6000 升到 16000", g.MAX_TOKENS == 16000)
 check("預設關掉 reasoning", g.DISABLE_REASONING is True)
 
+print("\n【大陸用語】OpenCC 唔會轉用詞,要另外處理")
+art_cn = {"keyword1": "視頻會議系統", "keyword2": "sd wan", "url1": "u", "url2": "u"}
+res_cn = {"h1": "企業通訊架構的演進", "sections": [
+    {"h2": None, "body": "谈到视频会议系统,不少企业关注带宽与质量。"},
+    {"h2": "網絡基建", "body": "运营商提供的云计算服务与数据库接口影响在线体验。"},
+    {"h2": "緩衝", "body": "默认往往不适合所有场景。"},
+    {"h2": "成本", "body": "移动支付与短信通知亦要考虑。"},
+    {"h2": "總結", "body": "搜索屏幕上的信息需要时间。"}]}
+cn = g._normalize_output(json.loads(json.dumps(res_cn)), "zh-HK", art_cn)
+body_cn = "".join(x["body"] for x in cn["sections"])
+for src, dst in [("帶寬", "頻寬"), ("質量", "質素"), ("運營商", "電訊商"),
+                 ("雲計算", "雲端運算"), ("數據庫", "資料庫"), ("接口", "介面"),
+                 ("在線", "網上"), ("移動支付", "流動支付"), ("短信", "短訊"),
+                 ("搜索", "搜尋"), ("屏幕", "螢幕"), ("信息", "資訊")]:
+    check(f"{src} → {dst}", dst in body_cn and src not in body_cn.replace("視頻會議系統", ""))
+check("keyword 本身含大陸用語都唔會被改爛", "視頻會議系統" in body_cn)
+check("keyword 內嘅大陸用語唔會報 false positive",
+      not any("漏網" in x for x in g.validate_content(cn, art_cn, "zh-HK")[1]))
+check("有歧義嘅只提示唔自動改",
+      any("疑似大陸用語" in x for x in g.validate_content(
+          g._normalize_output({"h1": "測試標題", "sections": [
+              {"h2": None, "body": "字" * 200 + "設置流程"},
+              {"h2": "A", "body": "字" * 200}, {"h2": "B", "body": "字" * 200},
+              {"h2": "C", "body": "字" * 200}, {"h2": "D", "body": "字" * 150}]},
+              "zh-HK", None),
+          {"keyword1": "", "keyword2": ""}, "zh-HK")[1]))
+
 print("\n" + "=" * 60)
 print(f"PASS {len(PASS)} / FAIL {len(FAIL)}")
 if FAIL:

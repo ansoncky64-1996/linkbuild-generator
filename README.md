@@ -13,6 +13,8 @@ DZ Linkbuild Article Generator —— 由 keyword Excel 生成合規嘅外連文
 - Buffer：兩個關鍵字之間要隔至少一整段
 - 字數：正文 750–1,000（不含標題），生成目標 820–960
 - 語言：中文稿唔准有簡體字、廣東話口語虛詞；英文稿唔准夾中文字；兩者都唔准破折號
+- 用詞：大陸用語（視頻／信息／質量／帶寬／運營商…）自動換返香港用語，
+  有歧義嘅（設置／水平）出警告畀人手判斷
 
 過唔到會自動叫 model 修正（最多 2 次），仍然唔過就重新生成（最多 3 次）。
 再唔得就保留最接近嘅草稿，**明確標示做未合規**並且獨立一區顯示／下載，
@@ -23,6 +25,10 @@ DZ Linkbuild Article Generator —— 由 keyword Excel 生成合規嘅外連文
 幾乎所有現代 model 都係 reasoning model，推理 token 同 completion 共用 `max_tokens`。
 本工具預設送 `reasoning={"enabled": false}` 並用較大嘅 `max_tokens`；provider 唔收
 就自動除返個參數重試。所以揀 model 唔使避開 reasoning model。
+
+UI 有 model picker 可以即場切換。大陸出品嘅 model（Qwen／DeepSeek／字節／Moonshot）
+中文最好，但一定會寫大陸用語 —— OpenCC 只轉字形唔轉用詞，所以本工具另外做咗
+用詞替換（見上面「用詞」一項）。
 
 ## 輸出格式
 

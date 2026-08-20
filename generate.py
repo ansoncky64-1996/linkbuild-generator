@@ -98,6 +98,30 @@ DASH_RE = re.compile(r"\s*[—–―]{1,2}\s*")
 SIMPLIFIED = set("们这个国说时来对开会为产业务应该么发过还实点动车马门问题头长间"
                  "东关观规视频网络电脑软风飞马鸟鱼龙进运达远连边过还这样单双证书"
                  "记认识语读写学习医药经济银钱费价买卖务员师专业级别类种样条纸张")
+# 大陸用語 → 香港用語。OpenCC 只轉字形唔轉用詞:「视频」會變「視頻」,
+# 字形完全正確,簡體檢查放行,但香港客戶要嘅係「影片」。
+# 大陸出品嘅 model(Qwen / DeepSeek / 字節 / Moonshot)一定會踩呢啲。
+# 只收無歧義嘅詞;有歧義嘅(水平/文件/設置/移動)放落 MAINLAND_WARN 只提示。
+MAINLAND_AUTOFIX = {
+    "視頻": "影片", "信息": "資訊", "質量": "質素", "服務器": "伺服器",
+    "短信": "短訊", "博客": "網誌", "搜索": "搜尋", "屏幕": "螢幕",
+    "默認": "預設", "帶寬": "頻寬", "運營商": "電訊商", "雲計算": "雲端運算",
+    "算法": "演算法", "數據庫": "資料庫", "接口": "介面", "在線": "網上",
+    "移動支付": "流動支付", "移動網絡": "流動網絡", "移動電話": "流動電話",
+    "移動裝置": "流動裝置", "移動設備": "流動裝置", "內存": "記憶體",
+    "硬盤": "硬碟", "登錄": "登入", "賬號": "帳戶", "賬戶": "帳戶",
+    "筆記本電腦": "手提電腦", "小區": "屋苑", "出租車": "的士",
+    "公交車": "巴士", "空調": "冷氣", "冰箱": "雪櫃", "概率": "機率",
+    "快遞": "速遞", "房價": "樓價", "一次性": "即棄",
+}
+# 由長到短,避免「移動支付」被「移動網絡」以外嘅短詞搶先
+MAINLAND_AUTOFIX_ORDER = sorted(MAINLAND_AUTOFIX, key=len, reverse=True)
+# 有歧義,唔敢自動改,只提示
+MAINLAND_WARN = {
+    "設置": "設定", "水平": "水準", "調研": "調查", "力度": "程度",
+    "抓手": "着力點", "落地": "落實", "賦能": "強化", "閉環": "完整流程",
+}
+
 # 廣東話口語虛詞(正式 deliverable 唔准出現)
 CANTO = ["嘅", "喺", "咗", "嚟", "唔", "冇", "哋", "幾耐", "點算", "邊個", "邊種",
          "鍾意", "而家", "嗰", "咁樣", "嘢", "梗係"]
@@ -560,19 +584,49 @@ def _remove_dashes(text, lang):
     return text
 
 
-def _normalize_output(result, lang):
+def _mainland_autofix(text, protect=()):
+    """大陸用語換返香港用語,但唔可以郁到關鍵字本身。
+
+    客戶關鍵字可能就係「視頻會議系統」,改咗個 keyword 就永遠 match 唔返,
+    所以先把關鍵字出現位置遮住,改完再還原。
+    """
+    if not text:
+        return text
+
+    spans = []
+
+    def stash(m):
+        spans.append(m.group(0))
+        return f"\x01{len(spans) - 1}\x02"
+
+    masked = text
+    for kw in sorted((k for k in protect if k), key=len, reverse=True):
+        masked = _kw_pattern(kw).sub(stash, masked)
+
+    for src in MAINLAND_AUTOFIX_ORDER:
+        masked = masked.replace(src, MAINLAND_AUTOFIX[src])
+
+    return re.sub(r"\x01(\d+)\x02", lambda m: spans[int(m.group(1))], masked)
+
+
+def _normalize_output(result, lang, article=None):
     """繁體轉換 + 破折號清理。
 
     一定要喺 keyword 處理之前跑:model 好常出簡體,
     如果先做 keyword 比對再轉繁,簡體寫嘅關鍵字會走漏,
     轉繁之後就變成一個冇 hyperlink 嘅重複關鍵字。
     """
+    protect = ()
+    if article:
+        protect = (article.get("keyword1", ""), article.get("keyword2", ""))
+
     def clean(s):
         if not s:
             return s
         s = _remove_dashes(s, lang)
         if lang == "zh-HK":
             s = _to_traditional(s)
+            s = _mainland_autofix(s, protect)
         return s
 
     result["h1"] = clean(result.get("h1", ""))
@@ -735,6 +789,18 @@ def validate_content(result, article, lang):
         canto = [w for w in CANTO if w in full_raw]
         if canto:
             fails.append("偵測到廣東話口語虛詞:" + " ".join(canto))
+        # 關鍵字本身可能就係大陸用語(例如客戶指定「視頻會議系統」),
+        # 嗰啲唔算漏網,掃之前要遮住。
+        vocab_scan = full_raw
+        for _m, _kw, _u in _keyword_slots(article):
+            vocab_scan = _kw_pattern(_kw).sub("", vocab_scan)
+        mainland = [f"{w}→{MAINLAND_WARN[w]}" for w in MAINLAND_WARN if w in vocab_scan]
+        if mainland:
+            warns.append("疑似大陸用語(要人手判斷):" + " ".join(mainland))
+        leaked = [f"{w}→{MAINLAND_AUTOFIX[w]}" for w in MAINLAND_AUTOFIX_ORDER
+                  if w in vocab_scan]
+        if leaked:
+            warns.append("大陸用語自動替換有漏網:" + " ".join(leaked))
         variants = sorted(set(full_raw) & set(HK_GLYPH_RESTORE))
         if variants:
             warns.append(
@@ -1037,7 +1103,7 @@ def generate_article_content(article, api_key, model, max_retries=3,
 
             for repair_round in range(max_repairs + 1):
                 # 次序好重要:先轉繁 → 先擺 marker → 再清 stray marker → 最後驗
-                result = _normalize_output(result, lang)
+                result = _normalize_output(result, lang, article)
                 result = _place_markers(result, article)
                 result, dropped = _strip_unmapped_markers(result, article)
                 if dropped:

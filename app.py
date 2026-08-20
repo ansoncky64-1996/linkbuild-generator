@@ -50,14 +50,16 @@ except Exception:
 # 每篇約 5k prompt token + 4k completion token（已計入平均 2.5 次 call）
 # 成本 = 每月 4 個 batch × 20 篇 = 80 篇
 MODEL_CHOICES = {
-    "google/gemini-3.7-flash":
-        "指令跟得最貼，中文好，約 $0.75/月　★ 建議",
     "qwen/qwen3.8-max":
-        "中文最強（阿里），約 $2.72/月",
+        "中文最強（阿里），指令跟得貼，約 $2.72/月　★ 建議",
     "deepseek/deepseek-v4-pro-0813":
         "同系列升級版，約 $1.62/月",
+    "qwen/qwen3.8-27b":
+        "細啲嘅 Qwen，抵用，約 $1.20/月",
     "bytedance-seed/seed-2-1-turbo":
         "中文原生（字節），約 $1.00/月",
+    "x-ai/grok-4.6":
+        "非中國出品，用詞較少大陸味，約 $2.72/月",
     "~deepseek/deepseek-v4-flash-latest":
         "最平但最唔聽話，約 $0.07/月",
 }
@@ -129,6 +131,11 @@ with st.expander("🤖 Model 設定", expanded=False):
         "幾乎所有新 model 都係 reasoning model，本工具會送 "
         "`reasoning={\"enabled\": false}` 同較大嘅 `max_tokens`，"
         "provider 唔收就自動除返個參數重試。"
+    )
+    st.caption(
+        "⚠️ 大陸出品嘅 model 會寫「視頻／信息／質量／帶寬」等大陸用語。"
+        "OpenCC 只轉字形唔轉用詞，所以本工具會另外自動換返香港用語，"
+        "有歧義嘅（設置／水平）會喺合規警告度提示。"
     )
 
 st.caption(f"🤖 而家用緊：`{MODEL}`")
