@@ -214,7 +214,7 @@ CANNED_GOOD = json.dumps({
 }, ensure_ascii=False)
 
 calls = []
-def fake_chat(api_key, model, prompt, max_tokens, temperature):
+def fake_chat(api_key, model, prompt, **kw):
     calls.append(prompt)
     return CANNED_BAD if len(calls) == 1 else CANNED_GOOD
 g._chat = fake_chat
@@ -232,7 +232,7 @@ if out:
 
 print("\n【End-to-end】改極都改唔好 → 一定要回 None,唔可以出稿")
 calls2 = []
-def always_bad(api_key, model, prompt, max_tokens, temperature):
+def always_bad(api_key, model, prompt, **kw):
     calls2.append(1)
     return CANNED_BAD
 g._chat = always_bad
@@ -240,7 +240,55 @@ import time as _t
 _orig_sleep = _t.sleep; _t.sleep = lambda *a: None
 bad_out = g.generate_article_content(e2e_art, "k", "m", max_retries=1, max_repairs=1)
 _t.sleep = _orig_sleep
-check("屢改不成 → 回 None(唔會靜靜地出短稿)", bad_out is None)
+check("屢改不成 → 明確標示未合規(唔會扮合格)",
+      bad_out is not None and bad_out.get("_compliant") is False and bad_out.get("_fails"))
+g._chat = always_bad
+_t.sleep = lambda *a: None
+none_out = g.generate_article_content(e2e_art, "k", "m", max_retries=1, max_repairs=1,
+                                      return_best_effort=False)
+_t.sleep = _orig_sleep
+check("return_best_effort=False → 回 None", none_out is None)
+
+print("\n【新修】reasoning model / 大細階 / JSON 容錯")
+check("中英混合 keyword 唔分大細階",
+      g._kw_count("業界普遍採用 MPLS 虛擬專用網絡 方案", "mpls 虛擬專用網絡") == 1)
+check("純英文 keyword 一樣唔分大細階", g._kw_count("SD-WAN and SD WAN", "sd wan") == 1)
+check("JSON 字串入面有原始換行都解析到",
+      g._extract_json('{"h1": "a\nb", "sections": []}')["h1"] == "a\nb")
+check("ARTICLE_SCHEMA 鎖死 5 個 section",
+      g.ARTICLE_SCHEMA["schema"]["properties"]["sections"]["minItems"] == 5
+      and g.ARTICLE_SCHEMA["schema"]["properties"]["sections"]["maxItems"] == 5)
+check("h2 schema 容許 null",
+      "null" in g.ARTICLE_SCHEMA["schema"]["properties"]["sections"]["items"]["properties"]["h2"]["type"])
+check("max_tokens 預設由 6000 升到 16000", g.MAX_TOKENS == 16000)
+check("預設關掉 reasoning", g.DISABLE_REASONING is True)
+
+print("\n【大陸用語】OpenCC 唔會轉用詞,要另外處理")
+art_cn = {"keyword1": "視頻會議系統", "keyword2": "sd wan", "url1": "u", "url2": "u"}
+res_cn = {"h1": "企業通訊架構的演進", "sections": [
+    {"h2": None, "body": "谈到视频会议系统,不少企业关注带宽与质量。"},
+    {"h2": "網絡基建", "body": "运营商提供的云计算服务与数据库接口影响在线体验。"},
+    {"h2": "緩衝", "body": "默认往往不适合所有场景。"},
+    {"h2": "成本", "body": "移动支付与短信通知亦要考虑。"},
+    {"h2": "總結", "body": "搜索屏幕上的信息需要时间。"}]}
+cn = g._normalize_output(json.loads(json.dumps(res_cn)), "zh-HK", art_cn)
+body_cn = "".join(x["body"] for x in cn["sections"])
+for src, dst in [("帶寬", "頻寬"), ("質量", "質素"), ("運營商", "電訊商"),
+                 ("雲計算", "雲端運算"), ("數據庫", "資料庫"), ("接口", "介面"),
+                 ("在線", "網上"), ("移動支付", "流動支付"), ("短信", "短訊"),
+                 ("搜索", "搜尋"), ("屏幕", "螢幕"), ("信息", "資訊")]:
+    check(f"{src} → {dst}", dst in body_cn and src not in body_cn.replace("視頻會議系統", ""))
+check("keyword 本身含大陸用語都唔會被改爛", "視頻會議系統" in body_cn)
+check("keyword 內嘅大陸用語唔會報 false positive",
+      not any("漏網" in x for x in g.validate_content(cn, art_cn, "zh-HK")[1]))
+check("有歧義嘅只提示唔自動改",
+      any("疑似大陸用語" in x for x in g.validate_content(
+          g._normalize_output({"h1": "測試標題", "sections": [
+              {"h2": None, "body": "字" * 200 + "設置流程"},
+              {"h2": "A", "body": "字" * 200}, {"h2": "B", "body": "字" * 200},
+              {"h2": "C", "body": "字" * 200}, {"h2": "D", "body": "字" * 150}]},
+              "zh-HK", None),
+          {"keyword1": "", "keyword2": ""}, "zh-HK")[1]))
 
 print("\n" + "=" * 60)
 print(f"PASS {len(PASS)} / FAIL {len(FAIL)}")

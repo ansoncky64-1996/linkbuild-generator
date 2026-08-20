@@ -61,12 +61,18 @@ def _emit(msg, sink=None, level=logging.INFO):
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 MODEL = os.environ.get("LB_MODEL", "~deepseek/deepseek-v4-flash-latest")
 DELAY_BETWEEN_CALLS = int(os.environ.get("LB_DELAY", "3"))
+# Reasoning model(例如 DeepSeek V4 Flash)嘅推理 token 同 completion token
+# 共用 max_tokens。舊值 6000 會俾推理食晒,content 回空 —— 呢個係
+# 「API returned empty content」嘅成因。
+MAX_TOKENS = int(os.environ.get("LB_MAX_TOKENS", "16000"))
+# 除非明確關掉,否則一律叫 provider 唔好做 reasoning。
+DISABLE_REASONING = os.environ.get("LB_DISABLE_REASONING", "1") != "0"
 
 # 交付規格(對齊 .claude/agents/dz-linkbuild/scripts/validate.py)
 MIN_BODY = 750
 MAX_BODY = 1000
-TARGET_MIN = 820          # 生成目標留 buffer,避免踩界
-TARGET_MAX = 960
+TARGET_MIN = 800          # 生成目標留 buffer,避免踩界
+TARGET_MAX = 900
 H1_LIMIT_CJK = 30
 H1_LIMIT_ASCII = 60
 N_SECTIONS = 5            # 1 個開篇 + 4 個 H2
@@ -92,6 +98,30 @@ DASH_RE = re.compile(r"\s*[—–―]{1,2}\s*")
 SIMPLIFIED = set("们这个国说时来对开会为产业务应该么发过还实点动车马门问题头长间"
                  "东关观规视频网络电脑软风飞马鸟鱼龙进运达远连边过还这样单双证书"
                  "记认识语读写学习医药经济银钱费价买卖务员师专业级别类种样条纸张")
+# 大陸用語 → 香港用語。OpenCC 只轉字形唔轉用詞:「视频」會變「視頻」,
+# 字形完全正確,簡體檢查放行,但香港客戶要嘅係「影片」。
+# 大陸出品嘅 model(Qwen / DeepSeek / 字節 / Moonshot)一定會踩呢啲。
+# 只收無歧義嘅詞;有歧義嘅(水平/文件/設置/移動)放落 MAINLAND_WARN 只提示。
+MAINLAND_AUTOFIX = {
+    "視頻": "影片", "信息": "資訊", "質量": "質素", "服務器": "伺服器",
+    "短信": "短訊", "博客": "網誌", "搜索": "搜尋", "屏幕": "螢幕",
+    "默認": "預設", "帶寬": "頻寬", "運營商": "電訊商", "雲計算": "雲端運算",
+    "算法": "演算法", "數據庫": "資料庫", "接口": "介面", "在線": "網上",
+    "移動支付": "流動支付", "移動網絡": "流動網絡", "移動電話": "流動電話",
+    "移動裝置": "流動裝置", "移動設備": "流動裝置", "內存": "記憶體",
+    "硬盤": "硬碟", "登錄": "登入", "賬號": "帳戶", "賬戶": "帳戶",
+    "筆記本電腦": "手提電腦", "小區": "屋苑", "出租車": "的士",
+    "公交車": "巴士", "空調": "冷氣", "冰箱": "雪櫃", "概率": "機率",
+    "快遞": "速遞", "房價": "樓價", "一次性": "即棄",
+}
+# 由長到短,避免「移動支付」被「移動網絡」以外嘅短詞搶先
+MAINLAND_AUTOFIX_ORDER = sorted(MAINLAND_AUTOFIX, key=len, reverse=True)
+# 有歧義,唔敢自動改,只提示
+MAINLAND_WARN = {
+    "設置": "設定", "水平": "水準", "調研": "調查", "力度": "程度",
+    "抓手": "着力點", "落地": "落實", "賦能": "強化", "閉環": "完整流程",
+}
+
 # 廣東話口語虛詞(正式 deliverable 唔准出現)
 CANTO = ["嘅", "喺", "咗", "嚟", "唔", "冇", "哋", "幾耐", "點算", "邊個", "邊種",
          "鍾意", "而家", "嗰", "咁樣", "嘢", "梗係"]
@@ -184,8 +214,13 @@ def _as_text(value):
 
 
 def _kw_pattern(kw):
-    """英文關鍵字唔分大細階,中文照原樣。"""
-    return re.compile(re.escape(kw), re.IGNORECASE if kw.isascii() else 0)
+    """一律唔分大細階。
+
+    中英混合嘅關鍵字(「mpls 虛擬專用網絡」)之前行 case-sensitive,
+    model 寫「MPLS 虛擬專用網絡」就 match 唔到,marker 貼唔落去。
+    大細階折疊對中文字冇影響,所以全部 IGNORECASE 係安全嘅。
+    """
+    return re.compile(re.escape(kw), re.IGNORECASE)
 
 
 def _kw_count(haystack, kw):
@@ -444,8 +479,10 @@ def build_prompt(article):
 5. H1 同所有 H2 都唔可以包含關鍵字或者佢嘅任何片段
 6. 一定要剛好 {N_SECTIONS} 個 sections,唔可以多亦唔可以少
 7. 文章主題唔可以直接等於關鍵字,要搵一個更上層嘅主題角度
-8. 正文總字數(不含標題)要喺 {TARGET_MIN}–{TARGET_MAX} 個漢字之間,
-   每個 section 大約 {TARGET_MIN // N_SECTIONS}–{TARGET_MAX // N_SECTIONS} 字
+8. 正文總字數(不含標題)必須喺 {TARGET_MIN}–{TARGET_MAX} 個漢字之間。
+   每個 section 只可以寫 {TARGET_MIN // N_SECTIONS}–{TARGET_MAX // N_SECTIONS} 個漢字,
+   五段加埋**絕對唔可以超過 {MAX_BODY} 字**。寧願寫少啲,唔好寫多。
+   寫之前先數清楚,唔好一路寫一路加內容
 9. H1 唔可以有任何標點符號,包括頓號、冒號、問號、引號
 """
 
@@ -491,8 +528,9 @@ Exactly {N_SECTIONS} sections: one opening (h2 = null) plus four H2 sections.
 5. Neither the H1 nor any H2 may contain a keyword or any fragment of one.
 6. Exactly {N_SECTIONS} sections, no more and no fewer.
 7. The article topic must not simply restate a keyword. Choose a broader angle.
-8. Total body word count excluding headings must land between {TARGET_MIN} and {TARGET_MAX} words,
-   roughly {TARGET_MIN // N_SECTIONS}-{TARGET_MAX // N_SECTIONS} words per section.
+8. Total body word count excluding headings MUST land between {TARGET_MIN} and {TARGET_MAX} words.
+   Each section may run only {TARGET_MIN // N_SECTIONS}-{TARGET_MAX // N_SECTIONS} words, and the five
+   together must NEVER exceed {MAX_BODY} words. Err on the short side, never the long side.
 9. The H1 must contain no punctuation of any kind, including colons, question marks and quotes.
 """
 
@@ -546,19 +584,49 @@ def _remove_dashes(text, lang):
     return text
 
 
-def _normalize_output(result, lang):
+def _mainland_autofix(text, protect=()):
+    """大陸用語換返香港用語,但唔可以郁到關鍵字本身。
+
+    客戶關鍵字可能就係「視頻會議系統」,改咗個 keyword 就永遠 match 唔返,
+    所以先把關鍵字出現位置遮住,改完再還原。
+    """
+    if not text:
+        return text
+
+    spans = []
+
+    def stash(m):
+        spans.append(m.group(0))
+        return f"\x01{len(spans) - 1}\x02"
+
+    masked = text
+    for kw in sorted((k for k in protect if k), key=len, reverse=True):
+        masked = _kw_pattern(kw).sub(stash, masked)
+
+    for src in MAINLAND_AUTOFIX_ORDER:
+        masked = masked.replace(src, MAINLAND_AUTOFIX[src])
+
+    return re.sub(r"\x01(\d+)\x02", lambda m: spans[int(m.group(1))], masked)
+
+
+def _normalize_output(result, lang, article=None):
     """繁體轉換 + 破折號清理。
 
     一定要喺 keyword 處理之前跑:model 好常出簡體,
     如果先做 keyword 比對再轉繁,簡體寫嘅關鍵字會走漏,
     轉繁之後就變成一個冇 hyperlink 嘅重複關鍵字。
     """
+    protect = ()
+    if article:
+        protect = (article.get("keyword1", ""), article.get("keyword2", ""))
+
     def clean(s):
         if not s:
             return s
         s = _remove_dashes(s, lang)
         if lang == "zh-HK":
             s = _to_traditional(s)
+            s = _mainland_autofix(s, protect)
         return s
 
     result["h1"] = clean(result.get("h1", ""))
@@ -721,6 +789,18 @@ def validate_content(result, article, lang):
         canto = [w for w in CANTO if w in full_raw]
         if canto:
             fails.append("偵測到廣東話口語虛詞:" + " ".join(canto))
+        # 關鍵字本身可能就係大陸用語(例如客戶指定「視頻會議系統」),
+        # 嗰啲唔算漏網,掃之前要遮住。
+        vocab_scan = full_raw
+        for _m, _kw, _u in _keyword_slots(article):
+            vocab_scan = _kw_pattern(_kw).sub("", vocab_scan)
+        mainland = [f"{w}→{MAINLAND_WARN[w]}" for w in MAINLAND_WARN if w in vocab_scan]
+        if mainland:
+            warns.append("疑似大陸用語(要人手判斷):" + " ".join(mainland))
+        leaked = [f"{w}→{MAINLAND_AUTOFIX[w]}" for w in MAINLAND_AUTOFIX_ORDER
+                  if w in vocab_scan]
+        if leaked:
+            warns.append("大陸用語自動替換有漏網:" + " ".join(leaked))
         variants = sorted(set(full_raw) & set(HK_GLYPH_RESTORE))
         if variants:
             warns.append(
@@ -802,49 +882,137 @@ def validate_content(result, article, lang):
 # ================================================================
 # OpenRouter plumbing
 # ================================================================
+ARTICLE_SCHEMA = {
+    "name": "linkbuild_article",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["h1", "sections"],
+        "properties": {
+            "h1": {"type": "string"},
+            "sections": {
+                "type": "array",
+                "minItems": N_SECTIONS,
+                "maxItems": N_SECTIONS,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["h2", "body"],
+                    "properties": {
+                        "h2": {"type": ["string", "null"]},
+                        "body": {"type": "string"},
+                    },
+                },
+            },
+        },
+    },
+}
+
+
 def _extract_json(raw):
     """由 model 回覆抽出 JSON object,容忍 code fence 同前後多餘文字。"""
     raw = raw.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
+    # strict=False:容忍字串入面嘅原始換行(Invalid control character)
     try:
-        return json.loads(raw)
+        return json.loads(raw, strict=False)
     except json.JSONDecodeError:
         start, end = raw.find("{"), raw.rfind("}")
         if start == -1 or end <= start:
             raise
-        return json.loads(raw[start:end + 1])
+        return json.loads(raw[start:end + 1], strict=False)
 
 
-def _chat(api_key, model, prompt, max_tokens, temperature):
-    resp = http_req.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        },
-        timeout=120,
-    )
-    if resp.status_code >= 400:
-        detail = ""
-        try:
-            detail = resp.json().get("error", {}).get("message", "")
-        except Exception:
-            detail = resp.text[:200]
-        raise http_req.exceptions.HTTPError(
-            f"OpenRouter {resp.status_code}: {detail} (model = {model!r})"
+def _chat(api_key, model, prompt, max_tokens=None, temperature=0.7,
+          schema=None, log=None):
+    """打 OpenRouter。
+
+    兩個關鍵設定:
+      * reasoning 預設關掉 —— reasoning model 嘅推理 token 同 completion
+        共用 max_tokens,唔關就成日回空 content。
+      * 支援 structured outputs 嘅 model 會用 json_schema,直接杜絕
+        「唔係合法 JSON」同「section 數量唔啱」。
+    provider 唔收邊個參數就會自動除返佢再試,唔會成篇失敗。
+    """
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens or MAX_TOKENS,
+    }
+    if DISABLE_REASONING:
+        payload["reasoning"] = {"enabled": False}
+    if schema:
+        payload["response_format"] = {"type": "json_schema", "json_schema": schema}
+
+    optional = ["reasoning", "response_format"]
+
+    while True:
+        resp = http_req.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=180,
         )
-    data = resp.json()
-    content = data.get("choices", [{}])[0].get("message", {}).get("content")
-    if not content:
-        raise ValueError("API returned empty content")
-    return content
+
+        if resp.status_code >= 400:
+            try:
+                detail = resp.json().get("error", {}).get("message", "")
+            except Exception:
+                detail = resp.text[:300]
+            # provider 唔支援某個參數就除返佢再試一次
+            dropped = next(
+                (k for k in optional
+                 if k in payload and k.replace("_", " ") in detail.lower().replace("_", " ")),
+                None,
+            )
+            if dropped:
+                _emit(f"provider 唔收 {dropped},除咗佢再試:{detail[:120]}", log,
+                      logging.WARNING)
+                payload.pop(dropped)
+                optional.remove(dropped)
+                continue
+            raise http_req.exceptions.HTTPError(
+                f"OpenRouter {resp.status_code}: {detail} (model = {model!r})"
+            )
+
+        data = resp.json()
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content = message.get("content")
+
+        if content:
+            return content
+
+        # 空 content:一定要講清楚點解,唔好再盲
+        usage = data.get("usage") or {}
+        detail_bits = [
+            f"finish_reason={choice.get('finish_reason')}",
+            f"native={choice.get('native_finish_reason')}",
+            f"completion_tokens={usage.get('completion_tokens')}",
+            f"max_tokens={payload['max_tokens']}",
+        ]
+        reasoning = message.get("reasoning") or ""
+        if reasoning:
+            detail_bits.append(f"reasoning_chars={len(reasoning)}")
+        if message.get("refusal"):
+            detail_bits.append(f"refusal={message['refusal'][:100]}")
+
+        # 推理食晒 budget:再加大一次 max_tokens 重試
+        if (reasoning or choice.get("finish_reason") == "length") \
+                and payload["max_tokens"] < 48000:
+            payload["max_tokens"] = min(payload["max_tokens"] * 3, 48000)
+            _emit("content 回空(" + ", ".join(detail_bits)
+                  + f"),max_tokens 加到 {payload['max_tokens']} 重試", log,
+                  logging.WARNING)
+            continue
+
+        raise ValueError("API 回空 content(" + ", ".join(detail_bits) + ")")
 
 
 def _assert_shape(result):
@@ -900,7 +1068,8 @@ Original JSON:
 {current}"""
 
     try:
-        raw = _chat(api_key, model, prompt, max_tokens=8000, temperature=0.5)
+        raw = _chat(api_key, model, prompt, temperature=0.5,
+                    schema=ARTICLE_SCHEMA, log=log)
         repaired = _extract_json(raw)
         _assert_shape(repaired)
         return repaired
@@ -910,7 +1079,7 @@ Original JSON:
 
 
 def generate_article_content(article, api_key, model, max_retries=3,
-                             max_repairs=2, log=None):
+                             max_repairs=2, log=None, return_best_effort=True):
     """生成一篇合規文章。過唔到 validate_content() 就唔會回稿。
 
     log:傳一個 list 入嚟就會收齊所有診斷訊息,UI 可以直接顯示,
@@ -922,16 +1091,19 @@ def generate_article_content(article, api_key, model, max_retries=3,
     lang = detect_language(article.get("keyword1", "") + article.get("keyword2", ""))
     num = article.get("number", "?")
     last_fails = []
+    best = None          # 過唔到 gate 但最接近嘅一份,唔好白白掉咗
+    best_score = None
 
     for attempt in range(max_retries):
         try:
-            raw = _chat(api_key, model, prompt, max_tokens=6000, temperature=0.7)
+            raw = _chat(api_key, model, prompt, temperature=0.7,
+                        schema=ARTICLE_SCHEMA, log=log)
             result = _extract_json(raw)
             _assert_shape(result)
 
             for repair_round in range(max_repairs + 1):
                 # 次序好重要:先轉繁 → 先擺 marker → 再清 stray marker → 最後驗
-                result = _normalize_output(result, lang)
+                result = _normalize_output(result, lang, article)
                 result = _place_markers(result, article)
                 result, dropped = _strip_unmapped_markers(result, article)
                 if dropped:
@@ -942,10 +1114,14 @@ def generate_article_content(article, api_key, model, max_retries=3,
                     result["_warnings"] = warns
                     result["_word_count"] = _count_words(result, lang, article)
                     result["_lang"] = lang
+                    result["_compliant"] = True
                     result["_log"] = list(log)
                     return result
 
                 last_fails = fails
+                if best_score is None or len(fails) < best_score:
+                    best, best_score = json.loads(json.dumps(result)), len(fails)
+                    best["_fails"] = list(fails)
                 if repair_round == max_repairs:
                     break
                 _emit(f"#{num} 合規未過({len(fails)} 項),第 {repair_round + 1} 次修正", log, logging.WARNING)
@@ -970,11 +1146,23 @@ def generate_article_content(article, api_key, model, max_retries=3,
                 time.sleep(10)
             continue
 
-    _emit(f"#{num} 試咗 {max_retries} 次都唔得,放棄", log, logging.ERROR)
+    _emit(f"#{num} 試咗 {max_retries} 次都唔得", log, logging.ERROR)
     if last_fails:
         _emit("最後一次未過嘅項目:", log, logging.ERROR)
         for f in last_fails:
             _emit(f"    • {f}", log, logging.ERROR)
+
+    if best is not None and return_best_effort:
+        # 過唔到 gate,但有一份接近嘅草稿。明確標示做未合規交返出去,
+        # 好過成篇冇 —— 由用家決定人手執定重跑。
+        best["_compliant"] = False
+        best["_warnings"] = []
+        best["_word_count"] = _count_words(best, lang, article)
+        best["_lang"] = lang
+        best["_log"] = list(log)
+        _emit(f"#{num} 交返一份未合規草稿({best_score} 項未過),需要人手處理",
+              log, logging.ERROR)
+        return best
     return None
 
 
@@ -1372,7 +1560,7 @@ def main():
 
     print(f"\n🤖 開始生成文章 (Model: {MODEL})")
     builder = DocBuilder()
-    done, failed = [], []
+    done, failed, noncompliant = [], [], []
 
     for article in tqdm(articles, desc="生成進度"):
         num = article["number"]
@@ -1380,6 +1568,10 @@ def main():
         tqdm.write(f"  #{num}: {kw1}" + (f" + {kw2}" if kw2 else ""))
 
         content = generate_article_content(article, api_key, MODEL)
+        if content and not content.get("_compliant", True):
+            noncompliant.append((article, content))
+            tqdm.write(f"  ⚠ #{num} 未合規({len(content.get('_fails', []))} 項),已隔開")
+            content = None
         if content:
             builder.build_article(article, content)
             done.append((article, content))
@@ -1396,8 +1588,13 @@ def main():
         time.sleep(DELAY_BETWEEN_CALLS)
 
     print(f"\n📝 生成完成: {len(done)}/{len(articles)} 篇")
+    if noncompliant:
+        print(f"  ⚠ 未合規(需人手處理): {[a['number'] for a, _ in noncompliant]}")
+        for a, c in noncompliant:
+            for f in c.get("_fails", []):
+                print(f"      #{a['number']} • {f}")
     if failed:
-        print(f"  ⚠ 失敗文章: {failed}")
+        print(f"  ⚠ 完全失敗: {failed}")
 
     placeholders = [
         a["number"] for a, c in done

@@ -43,9 +43,26 @@ if not API_KEY:
 
 DEFAULT_MODEL = "~deepseek/deepseek-v4-flash-latest"
 try:
-    MODEL = st.secrets.get("LB_MODEL", DEFAULT_MODEL)
+    CONFIGURED_MODEL = st.secrets.get("LB_MODEL", DEFAULT_MODEL)
 except Exception:
-    MODEL = os.environ.get("LB_MODEL", DEFAULT_MODEL)
+    CONFIGURED_MODEL = os.environ.get("LB_MODEL", DEFAULT_MODEL)
+
+# 每篇約 5k prompt token + 4k completion token（已計入平均 2.5 次 call）
+# 成本 = 每月 4 個 batch × 20 篇 = 80 篇
+MODEL_CHOICES = {
+    "qwen/qwen3.8-max":
+        "中文最強（阿里），指令跟得貼，約 $2.72/月　★ 建議",
+    "deepseek/deepseek-v4-pro-0813":
+        "同系列升級版，約 $1.62/月",
+    "qwen/qwen3.8-27b":
+        "細啲嘅 Qwen，抵用，約 $1.20/月",
+    "bytedance-seed/seed-2-1-turbo":
+        "中文原生（字節），約 $1.00/月",
+    "x-ai/grok-4.6":
+        "非中國出品，用詞較少大陸味，約 $2.72/月",
+    "~deepseek/deepseek-v4-flash-latest":
+        "最平但最唔聽話，約 $0.07/月",
+}
 
 
 # ================================================================
@@ -92,7 +109,36 @@ def list_sheets(file_bytes):
 # ================================================================
 st.title("🔗 DZ Linkbuild Generator")
 st.caption("上傳 Excel → 選擇 Batch → 合規檢查 → 生成 .docx → 下載後拖入 Google Drive")
-st.caption(f"🤖 Model：`{MODEL}`")
+with st.expander("🤖 Model 設定", expanded=False):
+    options = list(MODEL_CHOICES)
+    if CONFIGURED_MODEL not in options:
+        options.insert(0, CONFIGURED_MODEL)
+    options.append("✏️ 自訂")
+    picked = st.selectbox(
+        "生成用嘅 model",
+        options,
+        index=options.index(CONFIGURED_MODEL),
+        format_func=lambda m: (
+            m if m == "✏️ 自訂" else f"{m}　—　{MODEL_CHOICES.get(m, 'Secrets 設定')}"
+        ),
+        help="改咗只影響今次 session。想長期改就去 Streamlit Secrets 設 LB_MODEL。",
+    )
+    MODEL = (
+        st.text_input("自訂 model id", value=CONFIGURED_MODEL).strip()
+        if picked == "✏️ 自訂" else picked
+    )
+    st.caption(
+        "幾乎所有新 model 都係 reasoning model，本工具會送 "
+        "`reasoning={\"enabled\": false}` 同較大嘅 `max_tokens`，"
+        "provider 唔收就自動除返個參數重試。"
+    )
+    st.caption(
+        "⚠️ 大陸出品嘅 model 會寫「視頻／信息／質量／帶寬」等大陸用語。"
+        "OpenCC 只轉字形唔轉用詞，所以本工具會另外自動換返香港用語，"
+        "有歧義嘅（設置／水平）會喺合規警告度提示。"
+    )
+
+st.caption(f"🤖 而家用緊：`{MODEL}`")
 
 # ── Upload ──
 excel_file = st.file_uploader("📊 上傳 Linkbuilding Excel", type=["xlsx"])
@@ -284,6 +330,7 @@ def _generate_one(article, min_gap):
 if btn_generate or btn_dry:
     is_dry_run = btn_dry
     articles_with_content = []
+    noncompliant = []
     failed = []
     total = len(filtered)
 
@@ -299,6 +346,18 @@ if btn_generate or btn_dry:
                 st.error(f"❌ #{num} — {reason}")
                 with st.expander(f"🔍 #{num} 失敗詳情（{len(log)} 行）", expanded=False):
                     st.code("\n".join(log) or "（冇任何訊息）", language="text")
+            return
+        if not content.get("_compliant", True):
+            noncompliant.append((article, content))
+            with status_area:
+                st.warning(
+                    f"⚠️ #{num} — {content['h1']}　"
+                    f"（{content['_word_count']} 字，**{len(content.get('_fails', []))} 項未過**，要人手執）"
+                )
+                for f in content.get("_fails", []):
+                    st.caption(f"　　• {f}")
+                with st.expander(f"🔍 #{num} 生成過程（{len(content.get('_log', []))} 行）"):
+                    st.code("\n".join(content.get("_log", [])), language="text")
             return
         articles_with_content.append((article, content))
         unit = "words" if content["_lang"] == "en" else "字"
@@ -336,7 +395,12 @@ if btn_generate or btn_dry:
 
         articles_with_content.sort(key=lambda x: x[0]["number"])
 
-    progress_bar.progress(1.0, text=f"✅ 完成 {len(articles_with_content)}/{total} 篇")
+    progress_bar.progress(
+        1.0,
+        text=f"✅ 合規 {len(articles_with_content)}/{total} 篇"
+             + (f"，未合規 {len(noncompliant)} 篇" if noncompliant else "")
+             + (f"，失敗 {len(failed)} 篇" if failed else ""),
+    )
 
     # ── Output ──
     st.divider()
@@ -414,9 +478,38 @@ if btn_generate or btn_dry:
         if used_placeholder:
             st.warning(f"⚠️ 仲用緊 placeholder URL 嘅文章：{used_placeholder}")
 
+    if noncompliant:
+        st.divider()
+        st.subheader(f"⚠️ 未合規草稿（{len(noncompliant)} 篇，要人手執）")
+        st.caption("呢啲文生成到，但過唔到合規檢查。**唔會混入上面份交付稿**。")
+        buckets = {}
+        for a, c in noncompliant:
+            for f in c.get("_fails", []):
+                key = ("字數超標" if "超出" in f else
+                       "字數不足" if "唔夠" in f else
+                       "marker 缺失" if "搵唔到 marker" in f else
+                       "關鍵字字面重複" if "字面出現" in f else
+                       "keyword buffer" if "buffer" in f.lower() else f[:30])
+                buckets.setdefault(key, []).append(a["number"])
+        for reason, nums in sorted(buckets.items(), key=lambda kv: -len(kv[1])):
+            st.warning(f"**{reason}** — {len(nums)} 篇：{sorted(set(nums))}")
+
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as t:
+            build_docx_file(noncompliant, t.name)
+            nc_path = t.name
+        with open(nc_path, "rb") as f:
+            nc_bytes = f.read()
+        os.unlink(nc_path)
+        st.download_button(
+            f"⬇️ 下載未合規草稿（{len(noncompliant)} 篇）",
+            data=nc_bytes,
+            file_name=f"Batch_{selected_batch}_未合規草稿.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
     if failed:
         st.divider()
-        st.subheader(f"⚠️ 失敗文章（{len(failed)} 篇）")
+        st.subheader(f"❌ 完全失敗（{len(failed)} 篇）")
         buckets = {}
         for num, log in failed:
             buckets.setdefault(_summarise(log), []).append(num)
