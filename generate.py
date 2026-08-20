@@ -61,12 +61,35 @@ def _emit(msg, sink=None, level=logging.INFO):
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 MODEL = os.environ.get("LB_MODEL", "~deepseek/deepseek-v4-flash-latest")
 DELAY_BETWEEN_CALLS = int(os.environ.get("LB_DELAY", "3"))
-# Reasoning model(例如 DeepSeek V4 Flash)嘅推理 token 同 completion token
-# 共用 max_tokens。舊值 6000 會俾推理食晒,content 回空 —— 呢個係
-# 「API returned empty content」嘅成因。
-MAX_TOKENS = int(os.environ.get("LB_MAX_TOKENS", "16000"))
-# 除非明確關掉,否則一律叫 provider 唔好做 reasoning。
+# Reasoning model 嘅推理 token 同 completion token 共用 max_tokens。
+# 實測 DeepSeek V4 Flash 一篇文燒 18k–32k 個推理字元,設 16000 必爆,
+# 爆咗就 finish_reason=length、content 回空,但嗰 16000 個 token 照計錢。
+#
+# 重點:max_tokens 係上限唔係收費。設高唔會貴,設低先至燒錢 ——
+# 截斷嘅 call 要俾足錢但零產出。所以預設要留夠位。
+MAX_TOKENS = int(os.environ.get("LB_MAX_TOKENS", "64000"))
+# 除非明確關掉,否則一律叫 provider 收細 reasoning。
 DISABLE_REASONING = os.environ.get("LB_DISABLE_REASONING", "1") != "0"
+
+# 同一個 model 嘅 endpoint 特性學一次就夠,唔使每篇文重新撞一次板。
+# 之前每篇都會:被拒一次 → 再燒一個 16k token 嘅空 call → 先至成功。
+_ENDPOINT_CAPS = {}
+_CAPS_LOCK = threading.Lock()
+
+
+def _caps(model):
+    with _CAPS_LOCK:
+        return dict(_ENDPOINT_CAPS.setdefault(model, {
+            "reasoning_mode": "disable",   # disable → minimal → off
+            "min_max_tokens": MAX_TOKENS,
+        }))
+
+
+def _remember(model, **kw):
+    with _CAPS_LOCK:
+        _ENDPOINT_CAPS.setdefault(model, {
+            "reasoning_mode": "disable", "min_max_tokens": MAX_TOKENS,
+        }).update(kw)
 
 # 交付規格(對齊 .claude/agents/dz-linkbuild/scripts/validate.py)
 MIN_BODY = 750
@@ -936,14 +959,18 @@ def _chat(api_key, model, prompt, max_tokens=None, temperature=0.7,
         「唔係合法 JSON」同「section 數量唔啱」。
     provider 唔收邊個參數就會自動除返佢再試,唔會成篇失敗。
     """
+    caps = _caps(model)
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
-        "max_tokens": max_tokens or MAX_TOKENS,
+        "max_tokens": max(max_tokens or MAX_TOKENS, caps["min_max_tokens"]),
     }
-    if DISABLE_REASONING:
-        payload["reasoning"] = {"enabled": False}
+    if DISABLE_REASONING and caps["reasoning_mode"] != "off":
+        payload["reasoning"] = (
+            {"enabled": False} if caps["reasoning_mode"] == "disable"
+            else {"effort": "minimal"}
+        )
     if schema:
         payload["response_format"] = {"type": "json_schema", "json_schema": schema}
 
@@ -971,6 +998,21 @@ def _chat(api_key, model, prompt, max_tokens=None, temperature=0.7,
                  if k in payload and k.replace("_", " ") in detail.lower().replace("_", " ")),
                 None,
             )
+            if dropped == "reasoning":
+                # 唔准熄就試下叫佢諗少啲,再唔得先至完全唔送。
+                # 學到嘅嘢記落 _ENDPOINT_CAPS,下一篇唔使再撞一次。
+                mode = caps["reasoning_mode"]
+                nxt = "minimal" if mode == "disable" else "off"
+                _remember(model, reasoning_mode=nxt)
+                caps["reasoning_mode"] = nxt
+                _emit(f"provider 唔收 reasoning={mode},改用 {nxt}:{detail[:100]}",
+                      log, logging.WARNING)
+                if nxt == "minimal":
+                    payload["reasoning"] = {"effort": "minimal"}
+                else:
+                    payload.pop("reasoning")
+                    optional.remove("reasoning")
+                continue
             if dropped:
                 _emit(f"provider 唔收 {dropped},除咗佢再試:{detail[:120]}", log,
                       logging.WARNING)
@@ -1005,8 +1047,11 @@ def _chat(api_key, model, prompt, max_tokens=None, temperature=0.7,
 
         # 推理食晒 budget:再加大一次 max_tokens 重試
         if (reasoning or choice.get("finish_reason") == "length") \
-                and payload["max_tokens"] < 48000:
-            payload["max_tokens"] = min(payload["max_tokens"] * 3, 48000)
+                and payload["max_tokens"] < 200000:
+            payload["max_tokens"] = min(payload["max_tokens"] * 3, 200000)
+            # 記住呢個 model 要幾多位,之後每篇都由呢個數起跳,
+            # 唔使每篇都先燒一個註定截斷嘅 call。
+            _remember(model, min_max_tokens=payload["max_tokens"])
             _emit("content 回空(" + ", ".join(detail_bits)
                   + f"),max_tokens 加到 {payload['max_tokens']} 重試", log,
                   logging.WARNING)
