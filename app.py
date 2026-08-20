@@ -284,6 +284,7 @@ def _generate_one(article, min_gap):
 if btn_generate or btn_dry:
     is_dry_run = btn_dry
     articles_with_content = []
+    noncompliant = []
     failed = []
     total = len(filtered)
 
@@ -299,6 +300,18 @@ if btn_generate or btn_dry:
                 st.error(f"❌ #{num} — {reason}")
                 with st.expander(f"🔍 #{num} 失敗詳情（{len(log)} 行）", expanded=False):
                     st.code("\n".join(log) or "（冇任何訊息）", language="text")
+            return
+        if not content.get("_compliant", True):
+            noncompliant.append((article, content))
+            with status_area:
+                st.warning(
+                    f"⚠️ #{num} — {content['h1']}　"
+                    f"（{content['_word_count']} 字，**{len(content.get('_fails', []))} 項未過**，要人手執）"
+                )
+                for f in content.get("_fails", []):
+                    st.caption(f"　　• {f}")
+                with st.expander(f"🔍 #{num} 生成過程（{len(content.get('_log', []))} 行）"):
+                    st.code("\n".join(content.get("_log", [])), language="text")
             return
         articles_with_content.append((article, content))
         unit = "words" if content["_lang"] == "en" else "字"
@@ -336,7 +349,12 @@ if btn_generate or btn_dry:
 
         articles_with_content.sort(key=lambda x: x[0]["number"])
 
-    progress_bar.progress(1.0, text=f"✅ 完成 {len(articles_with_content)}/{total} 篇")
+    progress_bar.progress(
+        1.0,
+        text=f"✅ 合規 {len(articles_with_content)}/{total} 篇"
+             + (f"，未合規 {len(noncompliant)} 篇" if noncompliant else "")
+             + (f"，失敗 {len(failed)} 篇" if failed else ""),
+    )
 
     # ── Output ──
     st.divider()
@@ -414,9 +432,38 @@ if btn_generate or btn_dry:
         if used_placeholder:
             st.warning(f"⚠️ 仲用緊 placeholder URL 嘅文章：{used_placeholder}")
 
+    if noncompliant:
+        st.divider()
+        st.subheader(f"⚠️ 未合規草稿（{len(noncompliant)} 篇，要人手執）")
+        st.caption("呢啲文生成到，但過唔到合規檢查。**唔會混入上面份交付稿**。")
+        buckets = {}
+        for a, c in noncompliant:
+            for f in c.get("_fails", []):
+                key = ("字數超標" if "超出" in f else
+                       "字數不足" if "唔夠" in f else
+                       "marker 缺失" if "搵唔到 marker" in f else
+                       "關鍵字字面重複" if "字面出現" in f else
+                       "keyword buffer" if "buffer" in f.lower() else f[:30])
+                buckets.setdefault(key, []).append(a["number"])
+        for reason, nums in sorted(buckets.items(), key=lambda kv: -len(kv[1])):
+            st.warning(f"**{reason}** — {len(nums)} 篇：{sorted(set(nums))}")
+
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as t:
+            build_docx_file(noncompliant, t.name)
+            nc_path = t.name
+        with open(nc_path, "rb") as f:
+            nc_bytes = f.read()
+        os.unlink(nc_path)
+        st.download_button(
+            f"⬇️ 下載未合規草稿（{len(noncompliant)} 篇）",
+            data=nc_bytes,
+            file_name=f"Batch_{selected_batch}_未合規草稿.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
     if failed:
         st.divider()
-        st.subheader(f"⚠️ 失敗文章（{len(failed)} 篇）")
+        st.subheader(f"❌ 完全失敗（{len(failed)} 篇）")
         buckets = {}
         for num, log in failed:
             buckets.setdefault(_summarise(log), []).append(num)

@@ -214,7 +214,7 @@ CANNED_GOOD = json.dumps({
 }, ensure_ascii=False)
 
 calls = []
-def fake_chat(api_key, model, prompt, max_tokens, temperature):
+def fake_chat(api_key, model, prompt, **kw):
     calls.append(prompt)
     return CANNED_BAD if len(calls) == 1 else CANNED_GOOD
 g._chat = fake_chat
@@ -232,7 +232,7 @@ if out:
 
 print("\n【End-to-end】改極都改唔好 → 一定要回 None,唔可以出稿")
 calls2 = []
-def always_bad(api_key, model, prompt, max_tokens, temperature):
+def always_bad(api_key, model, prompt, **kw):
     calls2.append(1)
     return CANNED_BAD
 g._chat = always_bad
@@ -240,7 +240,28 @@ import time as _t
 _orig_sleep = _t.sleep; _t.sleep = lambda *a: None
 bad_out = g.generate_article_content(e2e_art, "k", "m", max_retries=1, max_repairs=1)
 _t.sleep = _orig_sleep
-check("屢改不成 → 回 None(唔會靜靜地出短稿)", bad_out is None)
+check("屢改不成 → 明確標示未合規(唔會扮合格)",
+      bad_out is not None and bad_out.get("_compliant") is False and bad_out.get("_fails"))
+g._chat = always_bad
+_t.sleep = lambda *a: None
+none_out = g.generate_article_content(e2e_art, "k", "m", max_retries=1, max_repairs=1,
+                                      return_best_effort=False)
+_t.sleep = _orig_sleep
+check("return_best_effort=False → 回 None", none_out is None)
+
+print("\n【新修】reasoning model / 大細階 / JSON 容錯")
+check("中英混合 keyword 唔分大細階",
+      g._kw_count("業界普遍採用 MPLS 虛擬專用網絡 方案", "mpls 虛擬專用網絡") == 1)
+check("純英文 keyword 一樣唔分大細階", g._kw_count("SD-WAN and SD WAN", "sd wan") == 1)
+check("JSON 字串入面有原始換行都解析到",
+      g._extract_json('{"h1": "a\nb", "sections": []}')["h1"] == "a\nb")
+check("ARTICLE_SCHEMA 鎖死 5 個 section",
+      g.ARTICLE_SCHEMA["schema"]["properties"]["sections"]["minItems"] == 5
+      and g.ARTICLE_SCHEMA["schema"]["properties"]["sections"]["maxItems"] == 5)
+check("h2 schema 容許 null",
+      "null" in g.ARTICLE_SCHEMA["schema"]["properties"]["sections"]["items"]["properties"]["h2"]["type"])
+check("max_tokens 預設由 6000 升到 16000", g.MAX_TOKENS == 16000)
+check("預設關掉 reasoning", g.DISABLE_REASONING is True)
 
 print("\n" + "=" * 60)
 print(f"PASS {len(PASS)} / FAIL {len(FAIL)}")
