@@ -14,8 +14,15 @@ DZ Linkbuild Article Generator —— 由 keyword Excel 生成合規嘅外連文
 - 字數：正文 750–1,000（不含標題），生成目標 820–960
 - 語言：中文稿唔准有簡體字、廣東話口語虛詞；英文稿唔准夾中文字；兩者都唔准破折號
 
-過唔到會自動叫 model 修正（最多 2 次），仍然唔過就重新生成（最多 3 次），
-再唔得就當呢篇失敗 —— **唔會靜靜地交唔合規嘅稿**。
+過唔到會自動叫 model 修正（最多 2 次），仍然唔過就重新生成（最多 3 次）。
+再唔得就保留最接近嘅草稿，**明確標示做未合規**並且獨立一區顯示／下載，
+唔會混入交付稿 —— 唔會靜靜地交唔合規嘅嘢，亦唔會白白掉咗成篇。
+
+## Model 選擇
+
+幾乎所有現代 model 都係 reasoning model，推理 token 同 completion 共用 `max_tokens`。
+本工具預設送 `reasoning={"enabled": false}` 並用較大嘅 `max_tokens`；provider 唔收
+就自動除返個參數重試。所以揀 model 唔使避開 reasoning model。
 
 ## 輸出格式
 
@@ -57,5 +64,7 @@ python3 .claude/agents/dz-linkbuild/scripts/validate.py out/001_關鍵字.docx
 | 變數 | 預設 | 說明 |
 |---|---|---|
 | `OPENROUTER_API_KEY` | — | 必填 |
-| `LB_MODEL` | `~deepseek/deepseek-v4-flash-latest` | OpenRouter model id |
+| `LB_MODEL` | `~deepseek/deepseek-v4-flash-latest` | OpenRouter model id（UI 有 picker 可即場切換） |
+| `LB_MAX_TOKENS` | `16000` | 單次 completion 上限。Reasoning model 嘅推理 token 同 completion 共用呢個 budget，太細會回空 content |
+| `LB_DISABLE_REASONING` | `1` | 預設送 `reasoning={"enabled": false}`。設 `0` 就唔送 |
 | `LB_DELAY` | `3` | CLI 每篇之間嘅間隔（秒） |

@@ -43,9 +43,24 @@ if not API_KEY:
 
 DEFAULT_MODEL = "~deepseek/deepseek-v4-flash-latest"
 try:
-    MODEL = st.secrets.get("LB_MODEL", DEFAULT_MODEL)
+    CONFIGURED_MODEL = st.secrets.get("LB_MODEL", DEFAULT_MODEL)
 except Exception:
-    MODEL = os.environ.get("LB_MODEL", DEFAULT_MODEL)
+    CONFIGURED_MODEL = os.environ.get("LB_MODEL", DEFAULT_MODEL)
+
+# 每篇約 5k prompt token + 4k completion token（已計入平均 2.5 次 call）
+# 成本 = 每月 4 個 batch × 20 篇 = 80 篇
+MODEL_CHOICES = {
+    "google/gemini-3.7-flash":
+        "指令跟得最貼，中文好，約 $0.75/月　★ 建議",
+    "qwen/qwen3.8-max":
+        "中文最強（阿里），約 $2.72/月",
+    "deepseek/deepseek-v4-pro-0813":
+        "同系列升級版，約 $1.62/月",
+    "bytedance-seed/seed-2-1-turbo":
+        "中文原生（字節），約 $1.00/月",
+    "~deepseek/deepseek-v4-flash-latest":
+        "最平但最唔聽話，約 $0.07/月",
+}
 
 
 # ================================================================
@@ -92,7 +107,31 @@ def list_sheets(file_bytes):
 # ================================================================
 st.title("🔗 DZ Linkbuild Generator")
 st.caption("上傳 Excel → 選擇 Batch → 合規檢查 → 生成 .docx → 下載後拖入 Google Drive")
-st.caption(f"🤖 Model：`{MODEL}`")
+with st.expander("🤖 Model 設定", expanded=False):
+    options = list(MODEL_CHOICES)
+    if CONFIGURED_MODEL not in options:
+        options.insert(0, CONFIGURED_MODEL)
+    options.append("✏️ 自訂")
+    picked = st.selectbox(
+        "生成用嘅 model",
+        options,
+        index=options.index(CONFIGURED_MODEL),
+        format_func=lambda m: (
+            m if m == "✏️ 自訂" else f"{m}　—　{MODEL_CHOICES.get(m, 'Secrets 設定')}"
+        ),
+        help="改咗只影響今次 session。想長期改就去 Streamlit Secrets 設 LB_MODEL。",
+    )
+    MODEL = (
+        st.text_input("自訂 model id", value=CONFIGURED_MODEL).strip()
+        if picked == "✏️ 自訂" else picked
+    )
+    st.caption(
+        "幾乎所有新 model 都係 reasoning model，本工具會送 "
+        "`reasoning={\"enabled\": false}` 同較大嘅 `max_tokens`，"
+        "provider 唔收就自動除返個參數重試。"
+    )
+
+st.caption(f"🤖 而家用緊：`{MODEL}`")
 
 # ── Upload ──
 excel_file = st.file_uploader("📊 上傳 Linkbuilding Excel", type=["xlsx"])
