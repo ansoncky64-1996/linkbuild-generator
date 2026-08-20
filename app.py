@@ -5,6 +5,7 @@ streamlit run app.py
 """
 
 import io
+import json
 import os
 import time
 import zipfile
@@ -140,6 +141,13 @@ with st.expander("🤖 Model 設定", expanded=False):
 
 st.caption(f"🤖 而家用緊：`{MODEL}`")
 
+# Streamlit Cloud 一斷線就會終止 script run,所有 local 變數即刻冇。
+# 所以每篇一生成好就即刻寫入 session_state,download 掣亦由 session_state
+# 渲染 —— 就算行到一半斷咗,已完成嗰啲仍然攞得返。
+st.session_state.setdefault("done", {})     # 合規稿 {(batch, num): (article, content)}
+st.session_state.setdefault("drafts", {})   # 未合規草稿,同樣要保住
+st.session_state.setdefault("logs", {})     # {(batch, num): [log lines]}
+
 # ── Upload ──
 excel_file = st.file_uploader("📊 上傳 Linkbuilding Excel", type=["xlsx"])
 
@@ -254,6 +262,14 @@ with st.expander("⚙️ 進階設定", expanded=False):
         "每次呼叫間隔（秒）", 0.0, 5.0, 1.5, step=0.5,
         help="避免同時打爆 OpenRouter rate limit。",
     )
+    FAIL_STREAK_LIMIT = st.slider(
+        "連續失敗幾多篇就自動停", 2, 20, 5,
+        help="個 model 唔啱用嘅時候，唔好燒足幾個鐘先知。",
+    )
+    skip_done = st.checkbox(
+        "跳過今個 session 已經生成好嘅文章", value=True,
+        help="斷咗線之後再撳一次，就只會補做未完成嗰啲。",
+    )
 
 # ── Buttons ──
 st.divider()
@@ -304,6 +320,122 @@ def _summarise(log):
     return "生成失敗（詳情見下面 log）"
 
 
+
+# ================================================================
+# 交付檔案（由 session_state 渲染，斷線都唔會冇）
+# ================================================================
+@st.cache_data(show_spinner=False)
+def _build_bytes_cached(payload_json):
+    """Streamlit 每次互動都會重跑成個 script，冇 cache 就會不停重 build。
+    payload_json 係 hashable，內容一樣就直接攞返 cache。"""
+    return _build_bytes(json.loads(payload_json))
+
+
+def _build_bytes(pairs):
+    """回 (合併 docx bytes, 每篇一個檔嘅 zip bytes)。"""
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+        build_docx_file(pairs, tmp.name)
+        combined_path = tmp.name
+    with open(combined_path, "rb") as f:
+        combined = f.read()
+    os.unlink(combined_path)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for article, content in pairs:
+            with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as t:
+                build_single_docx(article, content, t.name)
+                single = t.name
+            with open(single, "rb") as f:
+                zf.writestr(
+                    f"{article['number']:03d}_{article['keyword1'][:20]}.docx", f.read()
+                )
+            os.unlink(single)
+    return combined, buf.getvalue()
+
+
+def render_drafts(batch):
+    """未合規草稿。獨立一區、獨立檔案，永遠唔會混入交付稿。"""
+    pairs = sorted(
+        ((a, c) for (b, _n), (a, c) in st.session_state["drafts"].items() if b == batch),
+        key=lambda x: x[0]["number"],
+    )
+    if not pairs:
+        return
+    st.divider()
+    st.subheader(f"⚠️ 未合規草稿（{len(pairs)} 篇，要人手執）")
+    st.caption("呢啲文生成到，但過唔到合規檢查。**唔會混入上面份交付稿**。")
+
+    buckets = {}
+    for a, c in pairs:
+        for f in c.get("_fails", []):
+            key = ("字數超標" if "超出" in f else
+                   "字數不足" if "唔夠" in f else
+                   "marker 缺失" if "搵唔到 marker" in f else
+                   "關鍵字字面重複" if "字面出現" in f else
+                   "keyword buffer" if "buffer" in f.lower() else f[:30])
+            buckets.setdefault(key, []).append(a["number"])
+    for reason, nums in sorted(buckets.items(), key=lambda kv: -len(kv[1])):
+        st.warning(f"**{reason}** — {len(nums)} 篇：{sorted(set(nums))}")
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as t:
+        build_docx_file(pairs, t.name)
+        path = t.name
+    with open(path, "rb") as f:
+        data = f.read()
+    os.unlink(path)
+    st.download_button(
+        f"⬇️ 下載未合規草稿（{len(pairs)} 篇）", data=data,
+        file_name=f"Batch_{batch}_未合規草稿.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+
+def render_deliverables(batch):
+    """由 session_state 攞返呢個 batch 已完成嘅文章，永遠提供下載。"""
+    pairs = sorted(
+        ((a, c) for (b, _n), (a, c) in st.session_state["done"].items() if b == batch),
+        key=lambda x: x[0]["number"],
+    )
+    if not pairs:
+        return
+
+    st.divider()
+    nums = [a["number"] for a, _ in pairs]
+    st.subheader(f"📦 已生成（{len(pairs)} 篇）")
+    st.caption(f"文章編號：{nums}　—　呢個清單存喺 session，斷線／重跑都仲喺度。")
+
+    with st.spinner("📄 建立 Word 文件中..."):
+        combined, zipped = _build_bytes_cached(json.dumps(pairs, ensure_ascii=False))
+
+    name = f"Combined_Batch_{batch}_#{nums[0]}-{nums[-1]}"
+    c1, c2, c3 = st.columns([2, 2, 1])
+    with c1:
+        st.download_button(
+            f"⬇️ {name}.docx（合併稿）", data=combined, file_name=f"{name}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            type="primary", width="stretch",
+        )
+        st.caption("💡 下載後拖入 Google Drive → 自動轉為 Google Doc")
+    with c2:
+        st.download_button(
+            f"⬇️ {name}_single.zip（每篇一個檔）", data=zipped,
+            file_name=f"{name}_single.zip", mime="application/zip", width="stretch",
+        )
+        st.caption("💡 呢個 zip 可以直接跑 `validate.py`")
+    with c3:
+        if st.button("🗑️ 清空", width="stretch"):
+            for k in [k for k in st.session_state["done"] if k[0] == batch]:
+                del st.session_state["done"][k]
+            st.rerun()
+
+    placeholders = [
+        a["number"] for a, _ in pairs if PLACEHOLDER_URL in (a["url1"], a["url2"])
+    ]
+    if placeholders:
+        st.warning(f"⚠️ 仲用緊 placeholder URL：{placeholders}")
+
+
 _rate_lock = threading.Lock()
 _last_call = [0.0]
 
@@ -329,6 +461,13 @@ def _generate_one(article, min_gap):
 
 if btn_generate or btn_dry:
     is_dry_run = btn_dry
+    if skip_done and not is_dry_run:
+        already = {n for b, n in st.session_state["done"] if b == selected_batch}
+        skipped = [a["number"] for a in filtered if a["number"] in already]
+        if skipped:
+            st.info(f"⏭️ 跳過已完成：{skipped}")
+        filtered = [a for a in filtered if a["number"] not in already]
+        total = len(filtered)
     articles_with_content = []
     noncompliant = []
     failed = []
@@ -337,8 +476,21 @@ if btn_generate or btn_dry:
     progress_bar = st.progress(0, text="準備中...")
     status_area = st.container()
 
+    def _persist(article, content, log):
+        """合規同未合規要分開存,否則未合規草稿會混入交付稿。"""
+        key = (selected_batch, article["number"])
+        st.session_state["logs"][key] = log
+        if not content:
+            return
+        if content.get("_compliant", True):
+            st.session_state["done"][key] = (article, content)
+            st.session_state["drafts"].pop(key, None)
+        else:
+            st.session_state["drafts"][key] = (article, content)
+
     def _report(article, content, log):
         num = article["number"]
+        _persist(article, content, log)
         if not content:
             failed.append((num, log))
             reason = _summarise(log)
@@ -372,11 +524,28 @@ if btn_generate or btn_dry:
                 with st.expander(f"🔍 #{num} 生成過程（{len(content['_log'])} 行）", expanded=False):
                     st.code("\n".join(content["_log"]), language="text")
 
+    consecutive_fail = [0]
+    aborted = [False]
+
+    def _breaker():
+        """連續失敗太多就即刻收手，唔好燒足三個鐘先發現個 model 唔work。"""
+        if consecutive_fail[0] >= FAIL_STREAK_LIMIT:
+            aborted[0] = True
+            return True
+        return False
+
     if parallel <= 1:
         for i, article in enumerate(filtered):
+            if _breaker():
+                break
             label = f"#{article['number']}: {article['keyword1']}"
             progress_bar.progress(i / total, text=f"⏳（{i+1}/{total}）{label}")
-            _report(*_generate_one(article, stagger))
+            art, content, log = _generate_one(article, stagger)
+            if content and content.get("_compliant", True):
+                consecutive_fail[0] = 0
+            else:
+                consecutive_fail[0] += 1
+            _report(art, content, log)
     else:
         done_count = 0
         with ThreadPoolExecutor(max_workers=parallel) as executor:
@@ -386,7 +555,14 @@ if btn_generate or btn_dry:
             ]
             for future in as_completed(futures):
                 article, content, log = future.result()
+                if content and content.get("_compliant", True):
+                    consecutive_fail[0] = 0
+                else:
+                    consecutive_fail[0] += 1
                 done_count += 1
+                if _breaker():
+                    for f in futures:
+                        f.cancel()
                 progress_bar.progress(
                     done_count / total,
                     text=f"⏳（{done_count}/{total}）已完成 #{article['number']}",
@@ -394,6 +570,13 @@ if btn_generate or btn_dry:
                 _report(article, content, log)
 
         articles_with_content.sort(key=lambda x: x[0]["number"])
+
+    if aborted[0]:
+        st.error(
+            f"🛑 連續 {FAIL_STREAK_LIMIT} 篇失敗，已經自動停低，唔好再燒 token。"
+            "　請睇下面嘅失敗原因，換個 model 或者調整設定再試。"
+            "　**已完成嘅文章唔會冇咗**，喺下面「📦 已生成」度攞。"
+        )
 
     progress_bar.progress(
         1.0,
@@ -405,107 +588,24 @@ if btn_generate or btn_dry:
     # ── Output ──
     st.divider()
 
-    if not articles_with_content:
-        st.error("所有文章都生成失敗")
-    elif is_dry_run:
-        st.subheader("📝 文字預覽")
-        for article, content in articles_with_content:
-            with st.expander(f"#{article['number']} — {content['h1']}", expanded=False):
-                text = f"[H1: {content['h1']}]\n\n"
-                for sec in content["sections"]:
-                    if sec.get("h2"):
-                        text += f"[H2: {sec['h2']}]\n\n"
-                    text += sec.get("body", "") + "\n\n"
-                st.text(text)
-    else:
-        with st.spinner("📄 建立 Word 文件中..."):
-            nums = [a["number"] for a, _ in articles_with_content]
-            filename = f"Combined_Batch_{selected_batch}"
-            if len(articles_with_content) < len(articles):
-                filename += f"_#{nums[0]}-{nums[-1]}" if len(nums) > 2 \
-                    else "_#" + "_#".join(str(n) for n in nums)
-
-            with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp_docx:
-                build_docx_file(articles_with_content, tmp_docx.name)
-                tmp_docx_path = tmp_docx.name
-            with open(tmp_docx_path, "rb") as f:
-                docx_bytes = f.read()
-            os.unlink(tmp_docx_path)
-
-            # 每篇一個檔，可以直接跑 dz-linkbuild 嘅 validate.py
-            zip_buf = io.BytesIO()
-            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                for article, content in articles_with_content:
-                    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as t:
-                        build_single_docx(article, content, t.name)
-                        single_path = t.name
-                    with open(single_path, "rb") as f:
-                        zf.writestr(
-                            f"{article['number']:03d}_{article['keyword1'][:20]}.docx",
-                            f.read(),
-                        )
-                    os.unlink(single_path)
-            zip_bytes = zip_buf.getvalue()
-
+    if is_dry_run:
+        if not articles_with_content:
+            st.error("所有文章都生成失敗")
+        else:
+            st.subheader("📝 文字預覽")
+            for article, content in articles_with_content:
+                with st.expander(f"#{article['number']} — {content['h1']}", expanded=False):
+                    text = f"[H1: {content['h1']}]\n\n"
+                    for sec in content["sections"]:
+                        if sec.get("h2"):
+                            text += f"[H2: {sec['h2']}]\n\n"
+                        text += sec.get("body", "") + "\n\n"
+                    st.text(text)
+    elif articles_with_content:
         st.balloons()
-        st.success(f"🎉 已生成 {len(articles_with_content)} 篇文章，全部通過合規檢查")
-
-        col_d1, col_d2 = st.columns(2)
-        with col_d1:
-            st.download_button(
-                label=f"⬇️ 下載 {filename}.docx（合併稿）",
-                data=docx_bytes,
-                file_name=f"{filename}.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                type="primary",
-                width="stretch",
-            )
-            st.caption("💡 下載後拖入 Google Drive → 自動轉為 Google Doc")
-        with col_d2:
-            st.download_button(
-                label=f"⬇️ 下載 {filename}_single.zip（每篇一個檔）",
-                data=zip_bytes,
-                file_name=f"{filename}_single.zip",
-                mime="application/zip",
-                width="stretch",
-            )
-            st.caption("💡 呢個 zip 入面嘅檔可以直接跑 `validate.py` 做最終覆核")
-
-        used_placeholder = [
-            a["number"] for a, _ in articles_with_content
-            if PLACEHOLDER_URL in (a["url1"], a["url2"])
-        ]
-        if used_placeholder:
-            st.warning(f"⚠️ 仲用緊 placeholder URL 嘅文章：{used_placeholder}")
-
-    if noncompliant:
-        st.divider()
-        st.subheader(f"⚠️ 未合規草稿（{len(noncompliant)} 篇，要人手執）")
-        st.caption("呢啲文生成到，但過唔到合規檢查。**唔會混入上面份交付稿**。")
-        buckets = {}
-        for a, c in noncompliant:
-            for f in c.get("_fails", []):
-                key = ("字數超標" if "超出" in f else
-                       "字數不足" if "唔夠" in f else
-                       "marker 缺失" if "搵唔到 marker" in f else
-                       "關鍵字字面重複" if "字面出現" in f else
-                       "keyword buffer" if "buffer" in f.lower() else f[:30])
-                buckets.setdefault(key, []).append(a["number"])
-        for reason, nums in sorted(buckets.items(), key=lambda kv: -len(kv[1])):
-            st.warning(f"**{reason}** — {len(nums)} 篇：{sorted(set(nums))}")
-
-        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as t:
-            build_docx_file(noncompliant, t.name)
-            nc_path = t.name
-        with open(nc_path, "rb") as f:
-            nc_bytes = f.read()
-        os.unlink(nc_path)
-        st.download_button(
-            f"⬇️ 下載未合規草稿（{len(noncompliant)} 篇）",
-            data=nc_bytes,
-            file_name=f"Batch_{selected_batch}_未合規草稿.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
+        st.success(f"🎉 今次生成咗 {len(articles_with_content)} 篇，全部通過合規檢查")
+    elif not noncompliant and not failed:
+        st.info("今次冇生成任何新文章")
 
     if failed:
         st.divider()
@@ -523,3 +623,9 @@ if btn_generate or btn_dry:
             file_name="linkbuild_failures.log",
             mime="text/plain",
         )
+
+
+# ── 永遠渲染（就算今次冇按生成，之前做好嘅都攞得返）──
+if not btn_dry:
+    render_deliverables(selected_batch)
+    render_drafts(selected_batch)

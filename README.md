@@ -37,6 +37,16 @@ UI 有 model picker 可以即場切換。大陸出品嘅 model（Qwen／DeepSeek
 - 字體 Arial / Microsoft JhengHei
 - Excel 冇 target URL 會用 `https://example.com` placeholder，並且喺 UI 同 CLI 標示出嚟
 
+## 斷線唔會冇咗
+
+Streamlit Cloud 一斷線就會終止 script run，local 變數即刻清空。所以每篇一生成好
+就即刻寫入 `st.session_state`，下載掣亦由 session_state 渲染 —— 行到一半斷咗，
+已完成嗰啲仍然攞得返，再撳生成只會補做未完成嗰啲。
+
+合規稿同未合規草稿分開存，未合規嘅**永遠唔會混入交付稿**。
+
+連續失敗超過設定篇數（預設 5）會自動停低，唔會燒足幾個鐘先發現個 model 唔啱用。
+
 ## 用法
 
 Web UI：
@@ -71,6 +81,6 @@ python3 .claude/agents/dz-linkbuild/scripts/validate.py out/001_關鍵字.docx
 |---|---|---|
 | `OPENROUTER_API_KEY` | — | 必填 |
 | `LB_MODEL` | `~deepseek/deepseek-v4-flash-latest` | OpenRouter model id（UI 有 picker 可即場切換） |
-| `LB_MAX_TOKENS` | `16000` | 單次 completion 上限。Reasoning model 嘅推理 token 同 completion 共用呢個 budget，太細會回空 content |
+| `LB_MAX_TOKENS` | `64000` | 單次 completion 上限。**設高唔會貴，設低先至燒錢** —— 推理 token 同 completion 共用呢個 budget，截斷咗要俾足錢但零產出。實測一篇文燒 18k–32k 個推理字元 |
 | `LB_DISABLE_REASONING` | `1` | 預設送 `reasoning={"enabled": false}`。設 `0` 就唔送 |
 | `LB_DELAY` | `3` | CLI 每篇之間嘅間隔（秒） |

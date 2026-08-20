@@ -260,7 +260,10 @@ check("ARTICLE_SCHEMA 鎖死 5 個 section",
       and g.ARTICLE_SCHEMA["schema"]["properties"]["sections"]["maxItems"] == 5)
 check("h2 schema 容許 null",
       "null" in g.ARTICLE_SCHEMA["schema"]["properties"]["sections"]["items"]["properties"]["h2"]["type"])
-check("max_tokens 預設由 6000 升到 16000", g.MAX_TOKENS == 16000)
+check("max_tokens 預設留夠位俾 reasoning（實測燒到 32k 字元）", g.MAX_TOKENS == 64000)
+check("同一個 model 嘅 endpoint 特性只學一次",
+      g._caps("m1")["reasoning_mode"] == "disable"
+      and (g._remember("m1", reasoning_mode="off") or g._caps("m1")["reasoning_mode"] == "off"))
 check("預設關掉 reasoning", g.DISABLE_REASONING is True)
 
 print("\n【大陸用語】OpenCC 唔會轉用詞,要另外處理")
