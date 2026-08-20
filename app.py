@@ -4,9 +4,12 @@ Digital Zoo Linkbuild Generator — Web UI
 streamlit run app.py
 """
 
+import io
 import os
 import time
+import zipfile
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
@@ -18,10 +21,12 @@ st.set_page_config(
 )
 
 from generate import (
-    parse_excel,
-    generate_article_content,
+    PLACEHOLDER_URL,
     build_docx_file,
+    build_single_docx,
     detect_language,
+    generate_article_content,
+    parse_excel,
 )
 
 # ================================================================
@@ -36,33 +41,48 @@ if not API_KEY:
     st.error("⚠️ 請設定 OPENROUTER_API_KEY（Streamlit Secrets 或環境變數）")
     st.stop()
 
+DEFAULT_MODEL = "~deepseek/deepseek-v4-flash-latest"
 try:
-    MODEL = st.secrets.get("LB_MODEL", "~deepseek/deepseek-v4-flash-latest")
+    MODEL = st.secrets.get("LB_MODEL", DEFAULT_MODEL)
 except Exception:
-    MODEL = os.environ.get("LB_MODEL", "~deepseek/deepseek-v4-flash-latest")
+    MODEL = os.environ.get("LB_MODEL", DEFAULT_MODEL)
 
 
 # ================================================================
 # Cached Excel parsing (only runs ONCE per file, not on every click)
 # ================================================================
 @st.cache_data(show_spinner="📊 讀取 Excel 中...")
-def load_all_batches(file_bytes):
+def load_all_batches(file_bytes, sheet_name=None):
     """Parse Excel once and cache results. Re-runs only when file changes."""
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
     try:
-        from openpyxl import load_workbook
-        wb = load_workbook(tmp_path)
-        sheet_name = wb.sheetnames[0]
         batch_counts = {}
+        warnings = []
         for b in range(1, 10):
-            arts = parse_excel(tmp_path, b, sheet_name)
+            report = []
+            arts = parse_excel(tmp_path, b, sheet_name, report=report)
             if arts:
                 batch_counts[b] = arts
+                warnings.extend(f"Batch {b}：{w}" for w in report)
+        return batch_counts, warnings
+    finally:
+        os.unlink(tmp_path)
+
+
+@st.cache_data(show_spinner=False)
+def list_sheets(file_bytes):
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(tmp_path, read_only=True)
+        names = list(wb.sheetnames)
         wb.close()
-        return batch_counts
+        return names
     finally:
         os.unlink(tmp_path)
 
@@ -71,7 +91,8 @@ def load_all_batches(file_bytes):
 # UI
 # ================================================================
 st.title("🔗 DZ Linkbuild Generator")
-st.caption("上傳 Excel → 選擇 Batch → 生成 .docx → 下載後拖入 Google Drive")
+st.caption("上傳 Excel → 選擇 Batch → 合規檢查 → 生成 .docx → 下載後拖入 Google Drive")
+st.caption(f"🤖 Model：`{MODEL}`")
 
 # ── Upload ──
 excel_file = st.file_uploader("📊 上傳 Linkbuilding Excel", type=["xlsx"])
@@ -80,11 +101,19 @@ if not excel_file:
     st.info("👆 請先上傳 Excel 檔案")
     st.stop()
 
-# Parse (cached — instant on 2nd+ interaction)
-batch_counts = load_all_batches(excel_file.getvalue())
+file_bytes = excel_file.getvalue()
+sheet_names = list_sheets(file_bytes)
+sheet_name = st.selectbox("📄 選擇 Sheet", sheet_names, index=0)
+
+batch_counts, parse_warnings = load_all_batches(file_bytes, sheet_name)
+
+if parse_warnings:
+    with st.expander(f"⚠️ Excel 讀取警告（{len(parse_warnings)} 項）", expanded=True):
+        for w in parse_warnings:
+            st.warning(w)
 
 if not batch_counts:
-    st.error("找不到任何 Batch 資料")
+    st.error(f"Sheet「{sheet_name}」搵唔到任何 Batch 資料。請確認 A 欄有「Batch N」標籤。")
     st.stop()
 
 # ── Select (instant, no re-parsing) ──
@@ -154,14 +183,30 @@ with st.expander(f"📋 預覽（{len(filtered)} 篇）", expanded=False):
             "Keyword 2": a["keyword2"] or "—",
             "Category": a["category"],
             "語言": "中文" if lang == "zh-HK" else "EN",
+            "備註": "；".join(a.get("warnings", [])) or "—",
         })
     st.dataframe(preview_data, use_container_width=True, hide_index=True)
+
+# ── Excel-level 警告 ──
+placeholder_articles = [
+    a["number"] for a in filtered
+    if PLACEHOLDER_URL in (a["url1"], a["url2"])
+]
+if placeholder_articles:
+    st.warning(
+        f"⚠️ 以下文章喺 Excel 冇 target URL，會用 placeholder "
+        f"`{PLACEHOLDER_URL}`，交稿前必須換返真實連結：{placeholder_articles}"
+    )
 
 # ── Settings ──
 with st.expander("⚙️ 進階設定", expanded=False):
     parallel = st.slider(
         "同時生成篇數", 1, 5, 3,
         help="同時呼叫 API 的數量。越大越快，但太高可能觸發 rate limit。",
+    )
+    stagger = st.slider(
+        "每次呼叫間隔（秒）", 0.0, 5.0, 1.5, step=0.5,
+        help="避免同時打爆 OpenRouter rate limit。",
     )
 
 # ── Buttons ──
@@ -180,8 +225,24 @@ if no_articles and select_mode == "🔢 指定文章編號":
 # ================================================================
 # Generation
 # ================================================================
-def _generate_one(article):
+_rate_lock = threading.Lock()
+_last_call = [0.0]
+
+
+def _throttle(min_gap):
+    """全域節流，避免 parallel worker 同一刻打爆 rate limit。"""
+    if min_gap <= 0:
+        return
+    with _rate_lock:
+        wait = _last_call[0] + min_gap - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _last_call[0] = time.monotonic()
+
+
+def _generate_one(article, min_gap):
     """Worker function for parallel generation."""
+    _throttle(min_gap)
     content = generate_article_content(article, API_KEY, MODEL)
     return article, content
 
@@ -195,44 +256,43 @@ if btn_generate or btn_dry:
     progress_bar = st.progress(0, text="準備中...")
     status_area = st.container()
 
+    def _report(article, content):
+        num = article["number"]
+        if not content:
+            failed.append(num)
+            with status_area:
+                st.error(f"❌ #{num} — 生成失敗（合規檢查過唔到，詳情見伺服器 log）")
+            return
+        articles_with_content.append((article, content))
+        unit = "words" if content["_lang"] == "en" else "字"
+        with status_area:
+            st.success(
+                f"✅ #{num} — {content['h1']}　"
+                f"（{content['_word_count']} {unit}，合規通過）"
+            )
+            for w in content.get("_warnings", []):
+                st.caption(f"　　⚠️ {w}")
+
     if parallel <= 1:
         for i, article in enumerate(filtered):
-            num = article["number"]
-            label = f"#{num}: {article['keyword1']}"
+            label = f"#{article['number']}: {article['keyword1']}"
             progress_bar.progress(i / total, text=f"⏳（{i+1}/{total}）{label}")
-
-            content = generate_article_content(article, API_KEY, MODEL)
-            if content:
-                articles_with_content.append((article, content))
-                with status_area:
-                    st.success(f"✅ #{num} — {content['h1']}")
-            else:
-                failed.append(num)
-                with status_area:
-                    st.error(f"❌ #{num} — 生成失敗")
+            _report(*_generate_one(article, stagger))
     else:
         done_count = 0
         with ThreadPoolExecutor(max_workers=parallel) as executor:
-            futures = {
-                executor.submit(_generate_one, art): art
+            futures = [
+                executor.submit(_generate_one, art, stagger)
                 for art in filtered
-            }
+            ]
             for future in as_completed(futures):
                 article, content = future.result()
                 done_count += 1
-                num = article["number"]
                 progress_bar.progress(
                     done_count / total,
-                    text=f"⏳（{done_count}/{total}）已完成 #{num}",
+                    text=f"⏳（{done_count}/{total}）已完成 #{article['number']}",
                 )
-                if content:
-                    articles_with_content.append((article, content))
-                    with status_area:
-                        st.success(f"✅ #{num} — {content['h1']}")
-                else:
-                    failed.append(num)
-                    with status_area:
-                        st.error(f"❌ #{num} — 生成失敗")
+                _report(article, content)
 
         articles_with_content.sort(key=lambda x: x[0]["number"])
 
@@ -247,38 +307,72 @@ if btn_generate or btn_dry:
         st.subheader("📝 文字預覽")
         for article, content in articles_with_content:
             with st.expander(f"#{article['number']} — {content['h1']}", expanded=False):
-                text = f"H1：{content['h1']}\n\n"
+                text = f"[H1: {content['h1']}]\n\n"
                 for sec in content["sections"]:
                     if sec.get("h2"):
-                        text += f"H2：{sec['h2']}\n\n"
+                        text += f"[H2: {sec['h2']}]\n\n"
                     text += sec.get("body", "") + "\n\n"
                 st.text(text)
     else:
         with st.spinner("📄 建立 Word 文件中..."):
+            nums = [a["number"] for a, _ in articles_with_content]
             filename = f"Combined_Batch_{selected_batch}"
-            if len(filtered) < len(articles):
-                nums = [a["number"] for a in filtered]
-                filename += f"_#{nums[0]}-{nums[-1]}" if len(nums) > 2 else f"_#{'_#'.join(str(n) for n in nums)}"
-            filename += ".docx"
+            if len(articles_with_content) < len(articles):
+                filename += f"_#{nums[0]}-{nums[-1]}" if len(nums) > 2 \
+                    else "_#" + "_#".join(str(n) for n in nums)
 
             with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp_docx:
                 build_docx_file(articles_with_content, tmp_docx.name)
                 tmp_docx_path = tmp_docx.name
-
             with open(tmp_docx_path, "rb") as f:
                 docx_bytes = f.read()
             os.unlink(tmp_docx_path)
 
+            # 每篇一個檔，可以直接跑 dz-linkbuild 嘅 validate.py
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for article, content in articles_with_content:
+                    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as t:
+                        build_single_docx(article, content, t.name)
+                        single_path = t.name
+                    with open(single_path, "rb") as f:
+                        zf.writestr(
+                            f"{article['number']:03d}_{article['keyword1'][:20]}.docx",
+                            f.read(),
+                        )
+                    os.unlink(single_path)
+            zip_bytes = zip_buf.getvalue()
+
         st.balloons()
-        st.success(f"🎉 已生成 {len(articles_with_content)} 篇文章")
-        st.download_button(
-            label=f"⬇️ 下載 {filename}",
-            data=docx_bytes,
-            file_name=filename,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            type="primary",
-        )
-        st.caption("💡 下載後拖入 Google Drive → 自動轉為 Google Doc")
+        st.success(f"🎉 已生成 {len(articles_with_content)} 篇文章，全部通過合規檢查")
+
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            st.download_button(
+                label=f"⬇️ 下載 {filename}.docx（合併稿）",
+                data=docx_bytes,
+                file_name=f"{filename}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                type="primary",
+                use_container_width=True,
+            )
+            st.caption("💡 下載後拖入 Google Drive → 自動轉為 Google Doc")
+        with col_d2:
+            st.download_button(
+                label=f"⬇️ 下載 {filename}_single.zip（每篇一個檔）",
+                data=zip_bytes,
+                file_name=f"{filename}_single.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+            st.caption("💡 呢個 zip 入面嘅檔可以直接跑 `validate.py` 做最終覆核")
+
+        used_placeholder = [
+            a["number"] for a, _ in articles_with_content
+            if PLACEHOLDER_URL in (a["url1"], a["url2"])
+        ]
+        if used_placeholder:
+            st.warning(f"⚠️ 仲用緊 placeholder URL 嘅文章：{used_placeholder}")
 
     if failed:
         st.warning(f"⚠️ 失敗文章：{failed}")
