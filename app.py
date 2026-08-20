@@ -185,7 +185,7 @@ with st.expander(f"📋 預覽（{len(filtered)} 篇）", expanded=False):
             "語言": "中文" if lang == "zh-HK" else "EN",
             "備註": "；".join(a.get("warnings", [])) or "—",
         })
-    st.dataframe(preview_data, use_container_width=True, hide_index=True)
+    st.dataframe(preview_data, width="stretch", hide_index=True)
 
 # ── Excel-level 警告 ──
 placeholder_articles = [
@@ -214,9 +214,9 @@ st.divider()
 no_articles = len(filtered) == 0
 col_a, col_b, col_spacer = st.columns([1, 1, 2])
 with col_a:
-    btn_generate = st.button("🚀 生成文章", type="primary", use_container_width=True, disabled=no_articles)
+    btn_generate = st.button("🚀 生成文章", type="primary", width="stretch", disabled=no_articles)
 with col_b:
-    btn_dry = st.button("📝 Dry Run（預覽文字）", use_container_width=True, disabled=no_articles)
+    btn_dry = st.button("📝 Dry Run（預覽文字）", width="stretch", disabled=no_articles)
 
 if no_articles and select_mode == "🔢 指定文章編號":
     st.info("👆 請輸入要生成的文章編號")
@@ -225,6 +225,39 @@ if no_articles and select_mode == "🔢 指定文章編號":
 # ================================================================
 # Generation
 # ================================================================
+def _summarise(log):
+    """由 log 抽出一句人睇得明嘅失敗原因。"""
+    text = "\n".join(log)
+    if "429" in text or "rate" in text.lower():
+        return "API rate limit（調低同時生成篇數 / 加大間隔）"
+    if "OpenRouter 4" in text or "OpenRouter 5" in text:
+        line = next((l for l in log if "OpenRouter" in l), "")
+        return f"API 出錯 — {line.split('OpenRouter', 1)[-1].strip()[:120]}"
+    if "API 出錯" in text or "Timeout" in text or "ConnectionError" in text:
+        return "API 連線失敗 / timeout"
+    if "JSONDecodeError" in text or "Expecting" in text:
+        return "Model 回覆唔係合法 JSON"
+    bullets = [l.strip("• ").strip() for l in log if l.strip().startswith("•")]
+    if bullets:
+        top = {}
+        for b in bullets:
+            key = ("字數" if "字數" in b else
+                   "關鍵字字面重複" if "字面出現" in b else
+                   "marker 缺失" if "搵唔到 marker" in b else
+                   "關鍵字入咗標題" if "H1 或 H2" in b else
+                   "H1 有標點" if "H1 唔准有標點" in b else
+                   "H1 過長" if "H1 長度" in b else
+                   "簡體字" if "簡體" in b else
+                   "廣東話口語" if "廣東話" in b else
+                   "英文稿夾中文" if "中文字" in b else
+                   "破折號" if "破折號" in b else
+                   "Keyword buffer" if "buffer" in b.lower() else b[:40])
+            top[key] = top.get(key, 0) + 1
+        worst = max(top.items(), key=lambda kv: kv[1])[0]
+        return f"合規過唔到 — 主要係「{worst}」"
+    return "生成失敗（詳情見下面 log）"
+
+
 _rate_lock = threading.Lock()
 _last_call = [0.0]
 
@@ -241,10 +274,11 @@ def _throttle(min_gap):
 
 
 def _generate_one(article, min_gap):
-    """Worker function for parallel generation."""
+    """Worker function for parallel generation。log 會一齊帶返去畀 UI 顯示。"""
     _throttle(min_gap)
-    content = generate_article_content(article, API_KEY, MODEL)
-    return article, content
+    log = []
+    content = generate_article_content(article, API_KEY, MODEL, log=log)
+    return article, content, log
 
 
 if btn_generate or btn_dry:
@@ -256,12 +290,15 @@ if btn_generate or btn_dry:
     progress_bar = st.progress(0, text="準備中...")
     status_area = st.container()
 
-    def _report(article, content):
+    def _report(article, content, log):
         num = article["number"]
         if not content:
-            failed.append(num)
+            failed.append((num, log))
+            reason = _summarise(log)
             with status_area:
-                st.error(f"❌ #{num} — 生成失敗（合規檢查過唔到，詳情見伺服器 log）")
+                st.error(f"❌ #{num} — {reason}")
+                with st.expander(f"🔍 #{num} 失敗詳情（{len(log)} 行）", expanded=False):
+                    st.code("\n".join(log) or "（冇任何訊息）", language="text")
             return
         articles_with_content.append((article, content))
         unit = "words" if content["_lang"] == "en" else "字"
@@ -272,6 +309,9 @@ if btn_generate or btn_dry:
             )
             for w in content.get("_warnings", []):
                 st.caption(f"　　⚠️ {w}")
+            if content.get("_log"):
+                with st.expander(f"🔍 #{num} 生成過程（{len(content['_log'])} 行）", expanded=False):
+                    st.code("\n".join(content["_log"]), language="text")
 
     if parallel <= 1:
         for i, article in enumerate(filtered):
@@ -286,13 +326,13 @@ if btn_generate or btn_dry:
                 for art in filtered
             ]
             for future in as_completed(futures):
-                article, content = future.result()
+                article, content, log = future.result()
                 done_count += 1
                 progress_bar.progress(
                     done_count / total,
                     text=f"⏳（{done_count}/{total}）已完成 #{article['number']}",
                 )
-                _report(article, content)
+                _report(article, content, log)
 
         articles_with_content.sort(key=lambda x: x[0]["number"])
 
@@ -354,7 +394,7 @@ if btn_generate or btn_dry:
                 file_name=f"{filename}.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
             )
             st.caption("💡 下載後拖入 Google Drive → 自動轉為 Google Doc")
         with col_d2:
@@ -363,7 +403,7 @@ if btn_generate or btn_dry:
                 data=zip_bytes,
                 file_name=f"{filename}_single.zip",
                 mime="application/zip",
-                use_container_width=True,
+                width="stretch",
             )
             st.caption("💡 呢個 zip 入面嘅檔可以直接跑 `validate.py` 做最終覆核")
 
@@ -375,4 +415,18 @@ if btn_generate or btn_dry:
             st.warning(f"⚠️ 仲用緊 placeholder URL 嘅文章：{used_placeholder}")
 
     if failed:
-        st.warning(f"⚠️ 失敗文章：{failed}")
+        st.divider()
+        st.subheader(f"⚠️ 失敗文章（{len(failed)} 篇）")
+        buckets = {}
+        for num, log in failed:
+            buckets.setdefault(_summarise(log), []).append(num)
+        for reason, nums in sorted(buckets.items(), key=lambda kv: -len(kv[1])):
+            st.warning(f"**{reason}** — {len(nums)} 篇：{nums}")
+        st.download_button(
+            "⬇️ 下載完整失敗 log（.txt）",
+            data="\n\n".join(
+                f"===== #{num} =====\n" + "\n".join(log) for num, log in failed
+            ),
+            file_name="linkbuild_failures.log",
+            mime="text/plain",
+        )
