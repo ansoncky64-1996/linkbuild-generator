@@ -19,6 +19,7 @@ import sys
 import json
 import time
 import argparse
+import logging
 import re
 import threading
 from pathlib import Path
@@ -36,6 +37,27 @@ except ImportError:
 # ================================================================
 # Configuration
 # ================================================================
+# ================================================================
+# Logging
+# ================================================================
+# Streamlit Cloud 嘅 stdout 係 pipe,print() 會被 block-buffer(8KB)住,
+# 實際上永遠 flush 唔到,所以診斷訊息一定要行 logging(stderr)。
+logger = logging.getLogger("dz.linkbuild")
+if not logger.handlers:
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(_h)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
+def _emit(msg, sink=None, level=logging.INFO):
+    """寫落 stderr log,同時收埋落 sink,方便 UI 直接顯示畀用家睇。"""
+    logger.log(level, msg)
+    if sink is not None:
+        sink.append(msg)
+
+
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 MODEL = os.environ.get("LB_MODEL", "~deepseek/deepseek-v4-flash-latest")
 DELAY_BETWEEN_CALLS = int(os.environ.get("LB_DELAY", "3"))
@@ -835,7 +857,7 @@ def _assert_shape(result):
         assert result["sections"][idx].get("h2"), f"Section {idx} missing H2 title"
 
 
-def _repair_article(result, article, lang, problems, api_key, model):
+def _repair_article(result, article, lang, problems, api_key, model, log=None):
     """把合規問題列表交返畀 model 修。改唔到就回原本嗰份(由外層決定重生成)。
 
     Prompt 語言跟返文章語言 —— 舊版無論中英文都用中文 prompt 叫佢改,
@@ -883,12 +905,19 @@ Original JSON:
         _assert_shape(repaired)
         return repaired
     except Exception as e:
-        print(f"  ⚠ Repair failed: {e}")
+        _emit(f"修正失敗:{type(e).__name__}: {e}", log, logging.WARNING)
         return result
 
 
-def generate_article_content(article, api_key, model, max_retries=3, max_repairs=2):
-    """生成一篇合規文章。過唔到 validate_content() 就唔會回稿。"""
+def generate_article_content(article, api_key, model, max_retries=3,
+                             max_repairs=2, log=None):
+    """生成一篇合規文章。過唔到 validate_content() 就唔會回稿。
+
+    log:傳一個 list 入嚟就會收齊所有診斷訊息,UI 可以直接顯示,
+    唔使叫用家去掘 server log。
+    """
+    if log is None:
+        log = []
     prompt = build_prompt(article)
     lang = detect_language(article.get("keyword1", "") + article.get("keyword2", ""))
     num = article.get("number", "?")
@@ -906,23 +935,24 @@ def generate_article_content(article, api_key, model, max_retries=3, max_repairs
                 result = _place_markers(result, article)
                 result, dropped = _strip_unmapped_markers(result, article)
                 if dropped:
-                    print(f"  ⚠ #{num} 清走咗 {dropped} 個無效 marker")
+                    _emit(f"#{num} 清走咗 {dropped} 個無效 marker", log, logging.WARNING)
 
                 fails, warns = validate_content(result, article, lang)
                 if not fails:
                     result["_warnings"] = warns
                     result["_word_count"] = _count_words(result, lang, article)
                     result["_lang"] = lang
+                    result["_log"] = list(log)
                     return result
 
                 last_fails = fails
                 if repair_round == max_repairs:
                     break
-                print(f"  ⚠ #{num} 合規未過({len(fails)} 項),第 {repair_round + 1} 次修正")
+                _emit(f"#{num} 合規未過({len(fails)} 項),第 {repair_round + 1} 次修正", log, logging.WARNING)
                 for f in fails:
-                    print(f"      • {f}")
+                    _emit(f"    • {f}", log, logging.WARNING)
                 result = _repair_article(
-                    result, article, lang, fails, api_key, model
+                    result, article, lang, fails, api_key, model, log=log
                 )
 
             raise AssertionError(
@@ -930,21 +960,21 @@ def generate_article_content(article, api_key, model, max_retries=3, max_repairs
             )
 
         except (json.JSONDecodeError, AssertionError, KeyError, ValueError) as e:
-            print(f"  ⚠ #{num} Attempt {attempt+1}: {e}")
+            _emit(f"#{num} 第 {attempt+1} 次嘗試失敗:{type(e).__name__}: {e}", log, logging.WARNING)
             if attempt < max_retries - 1:
                 time.sleep(5)
             continue
         except http_req.exceptions.RequestException as e:
-            print(f"  ⚠ #{num} Attempt {attempt+1} API error: {e}")
+            _emit(f"#{num} 第 {attempt+1} 次嘗試 API 出錯:{type(e).__name__}: {e}", log, logging.ERROR)
             if attempt < max_retries - 1:
                 time.sleep(10)
             continue
 
-    print(f"  ✗ #{num} Failed after {max_retries} attempts")
+    _emit(f"#{num} 試咗 {max_retries} 次都唔得,放棄", log, logging.ERROR)
     if last_fails:
-        print("     最後一次未過嘅項目:")
+        _emit("最後一次未過嘅項目:", log, logging.ERROR)
         for f in last_fails:
-            print(f"       • {f}")
+            _emit(f"    • {f}", log, logging.ERROR)
     return None
 
 
